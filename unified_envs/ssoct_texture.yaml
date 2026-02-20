@@ -37,3 +37,5 @@ dependencies:
   - psutil
   - rich
   - tqdm
+
+  - pypdf2

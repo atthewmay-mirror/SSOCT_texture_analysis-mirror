@@ -96,11 +96,11 @@ def collate_stackable(slice_dicts, keys):
 
 # ---------------------------- IO helpers ----------------------------
 
-def load_vol_and_onh(vol_fp):
+def load_vol_and_onh(vol_fp,annotations_root):
     vol_fp = Path(vol_fp)
     vol = fu.load_ss_volume2(vol_fp, mmap=True)
 
-    onh_path = fu.image_to_annotation_path(vol_fp)
+    onh_path = fu.image_to_annotation_path(vol_fp,annotations_root)
     onh = da.from_zarr(onh_path)
     # if onh.shape != vol.shape:
     #     onh = subsample_volume(onh, vol.shape[0])
@@ -118,11 +118,12 @@ def build_work(vol, onh, z_idx, vol_id):
 
 # ---------------------------- main processing ----------------------------
 
-def process_volume_lite(vol_fp, *, z_step=1, max_workers=8, rpe_steps=None, out_dir=None):
+def process_volume_lite(vol_fp, *, z_step=1, max_workers=8, rpe_steps=None, out_dir=None,annotation_root=None):
     vol_fp = Path(vol_fp)
     vol_id = vol_fp.with_suffix("").name
 
-    vol, onh = load_vol_and_onh(vol_fp)
+    # vol, onh = load_vol_and_onh(vol_fp,annotation_root)
+    vol, onh = fu.load_vol_and_annotation(vol_fp,annotation_root)
 
     z_idx = np.arange(0, vol.shape[0], int(z_step))
     work = build_work(vol, onh, z_idx, vol_id)
@@ -167,23 +168,25 @@ def process_volume_lite(vol_fp, *, z_step=1, max_workers=8, rpe_steps=None, out_
     return vol_out
 
 
-def batch_process_dir_lite(volumes_root, *, pattern="*.npy",
+def batch_process_dir_lite(ALL_VOL_PATHS, *, 
                            z_step=1, max_workers=8, rpe_steps=None,
-                           outputs_root=None):
-    volumes_root = Path(volumes_root)
-
+                           outputs_root=None,
+                           annotation_root=None):
+    # volumes_root = Path(volumes_root)
     if outputs_root is None:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         outputs_root = Path("segmentation_outputs") / run_id
     outputs_root = Path(outputs_root)
     outputs_root.mkdir(parents=True, exist_ok=True)
 
-    for vol_path in sorted(volumes_root.glob(pattern)):
+    # ALL_VOL_PATHS = fu.get_all_vol_paths(volumes_root,pattern,)
+    for vol_path in sorted(ALL_VOL_PATHS):
         print("Processing", vol_path.name, flush=True)
         out = process_volume_lite(
             vol_path, 
             z_step=z_step, max_workers=max_workers,
-            rpe_steps=rpe_steps, out_dir=outputs_root
+            rpe_steps=rpe_steps, out_dir=outputs_root,
+            annotation_root=annotation_root
         )
         print("saved ->", out)
 
@@ -197,22 +200,26 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--volumes_root", type=str)
-    parser.add_argument("--pattern", type=str, default=".img")
+    parser.add_argument("--pattern", type=str, default=None)
     parser.add_argument("--z_step", type=int, default=1)
     parser.add_argument("--max_workers", type=int, default=8)
     parser.add_argument("--outputs_root", type=str)
+    parser.add_argument("--annotations_root", type=str)
+    parser.add_argument("--cube_numbers", type=str, default=None)
     args = parser.parse_args()
 
     # STEPS = sp.RPE_STEPS_1_25_26  # swap to your desired list
     STEPS = sp.RPE_STEPS_2_12_26  # swap to your desired list
 
+    ALL_VOL_PATHS = fu.get_all_vol_paths(args.volumes_root,args.pattern,args.cube_numbers)
+    print(f"going to be processing {ALL_VOL_PATHS}")
     batch_process_dir_lite(
-        args.volumes_root,
-        pattern=args.pattern,
+        ALL_VOL_PATHS,
         z_step=args.z_step,
         max_workers=args.max_workers,
         rpe_steps=STEPS,
         outputs_root=args.outputs_root,
+        annotation_root=args.annotations_root,
     )
 
 

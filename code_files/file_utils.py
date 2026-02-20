@@ -69,19 +69,21 @@ def downsample_layers(layers,xyz_step=(1,1,1)):
 
 def image_to_annotation_path(img_path: Path, ann_root: Path=None) -> Path:
     if ann_root is None:
+        print("using default path for annotation")
         ann_root = Path(C['annotation_root'])
-    else:
-        raise Exception # Should now be none, catch any unchanged occurances
+    # else:
+        # raise Exception # Should now be none, catch any unchanged occurances
     cand1 = ann_root / img_path.with_suffix(".labels.zarr").name
     cand2 = ann_root / img_path.with_suffix(".zarr").name
     return cand1 if cand1.exists() else cand2
 
 
-def load_vol_and_annotation(vol_path,annotation_root = "/Users/matthewhunt/Research/Iowa_Research/Han_AIR/testing_annotations"):
+# def load_vol_and_annotation(vol_path,annotation_root = "/Users/matthewhunt/Research/Iowa_Research/Han_AIR/testing_annotations"):
+def load_vol_and_annotation(vol_path,annotation_root = None):
     """loads the volume adn the ONH info and returns both"""
     vol = load_ss_volume2(vol_path,mmap=True) # should be fast and memory light?
     annotation_root = Path(annotation_root)
-    annotation_path = image_to_annotation_path(vol_path)
+    annotation_path = image_to_annotation_path(vol_path,annotation_root)
     ONH_info = da.from_zarr(annotation_path) # should be fast and memory light?)
     return vol,ONH_info
 
@@ -506,3 +508,29 @@ def load_work_from_yaml(yaml_path,headings,images_root=C['images_root']):
 #     with Executor(max_workers=max_workers) as ex:
 #         # executor.map preserves input order
 #         return list(ex.map(fn, items, chunksize=chunksize))
+
+def get_all_vol_paths(vol_dir,glob=None,cube_numbers=None):
+    """used in the viewer and also to be used in the 02_.py file. 
+    args should either have a glob or cube number, or maybe both if i refactor as such?"""
+
+    if glob:
+        ALL_VOL_PATHS = sorted(Path(vol_dir).glob(glob))
+    elif cube_numbers:
+        print("trying the cube numbers")
+        import re
+
+        want = [int(x) for x in cube_numbers.split(",")]
+        CUBE_RE = re.compile(r"^(\d+)_Cube ")
+        vol_dir = Path(vol_dir)
+        ALL_VOL_PATHS = sorted(
+            p for p in vol_dir.iterdir()
+            if p.is_file()
+            and (m := CUBE_RE.match(p.name))
+            and int(m.group(1)) in want
+        )
+    else:
+        print('neither arg glob or numbers supplied')
+    if not ALL_VOL_PATHS:
+        raise FileNotFoundError(f"No volumes in {vol_dir} matching {glob}")
+    return ALL_VOL_PATHS
+

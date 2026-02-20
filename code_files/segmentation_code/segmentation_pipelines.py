@@ -141,7 +141,7 @@ def process_bscan_1_3_26(idx_and_img,production_mode,rpe_seg_steps):
                         ilm_seg=ilm_ctx.ilm_raw,
                         ONH_region=ONH_info)
     rpe_ctx = ssf.run_pipeline(rpe_ctx,steps=rpe_seg_steps)
-    print(rpe_ctx.highres_cfg)
+    # print(rpe_ctx.highres_cfg)
     
     if PICKLE_CTX:
         print("gonna pickle it")

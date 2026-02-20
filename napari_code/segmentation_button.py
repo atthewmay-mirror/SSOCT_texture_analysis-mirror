@@ -28,7 +28,8 @@ DEFAULT_MINI_ROOT = (Path(__file__).resolve().parents[1] / "data_all_volumes_ext
 
 def _active_image_layer(viewer: napari.Viewer):
     layer = viewer.layers.selection.active
-    assert layer is not None
+    if layer is None:
+        print("hey, the layer is none, check this out")
     if layer is None or not isinstance(layer, napari.layers.Image):
         # fall back to first Image layer
         for L in viewer.layers:
@@ -97,6 +98,7 @@ def _build_subprocess_cmd(
 
     if debug:
         # Run under pdb and force debug mode in the script
+        cmd = [cmd[0]] +  ["-m", "pdb", "-c", "continue", '--'] + cmd[1:]
         cmd += [ "--debug"]
     if run_extra_slices:
         cmd += [ "--run_extra_slices"]
@@ -158,10 +160,10 @@ class SegmentationButton(QWidget):
             if "src_path" in layer.metadata:
                 img_path = Path(layer.metadata["src_path"])
 
-                print("unable to get the src_path directly from the Path(layer.metadata")
             # Fallback: if layer was loaded via a napari reader plugin, it may have .source.path
             elif getattr(layer, "source", None) and getattr(layer.source, "path", None):
                 img_path = Path(layer.source.path)
+                print("unable to get the src_path directly from the Path(layer.metadata")
             else:
                 QMessageBox.warning(self, "Missing source path",
                                     "This layer has no recorded file path (metadata['src_path']).")
@@ -205,7 +207,12 @@ class SegmentationButton(QWidget):
             # subprocess.Popen(cmd)
             # self.viewer.status = f"Launched external segmentation job → {out_pdf.name}"
         except Exception as e:
-            QMessageBox.critical(self, "Launch error", str(e))
+            # QMessageBox.critical(self, "Launch error", str(e))
+            tb = traceback.format_exc()
+            print(tb)  # goes to terminal if you launched napari from Terminal
+            QMessageBox.critical(self, "Launch error", tb)
+            # (optional) re-raise during development so napari debug tools catch it
+            # raise
 
 
 def add_segmentation_button(viewer: napari.Viewer) -> SegmentationButton:

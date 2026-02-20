@@ -65,9 +65,13 @@ def parse_args():
     p.add_argument(
         "--glob",
         type=str,
-        default="*.npy",
+        # default="*.npy",
         help="Glob pattern inside --vol_dir to find volumes (default: *.npy)."
     )
+
+    # p.add_argument("--cube_numbers", type=int, nargs="+", default=[], help="List of ints")
+    p.add_argument("--cube_numbers", type=str, default=None)
+
 
     p.add_argument(
         "--labels_dir_suffix",
@@ -189,8 +193,10 @@ def ensure_labels_zarr(vol_path: Path, z_stride: int,overwrite: bool,dir_suffix:
 
 
         LABEL_SETS = {
-            "ilm_rpe_refined": ["ilm_smooth", "rpe_refined1", "rpe_refined2"],
+            # "ilm_rpe_refined": ["ilm_smooth", "rpe_refined1", "rpe_refined2"],
+            "ilm_rpe_refined": ["ilm_smooth", "rpe_smooth2"],
             "rpe_family":      ["rpe_raw", "rpe_smooth", "hypersmoother_path"],
+            "two_layer_family":      ["y1_rescaled", "y2_rescaled"],
         }
  
         vols = {}
@@ -401,7 +407,37 @@ def main():
         print("will by default overwrite_labels bc overwrithe_files=True")
         OVERWRITE_LABELS = True
 
-    ALL_VOL_PATHS = sorted(Path(args.vol_dir).glob(args.glob))
+    if args.glob:
+        ALL_VOL_PATHS = sorted(Path(args.vol_dir).glob(args.glob))
+    elif args.cube_numbers:
+        print("trying the cube numbers")
+        import re
+
+        want = [int(x) for x in args.cube_numbers.split(",")]
+        CUBE_RE = re.compile(r"^(\d+)_Cube ")
+        vol_dir = Path(args.vol_dir)
+        # want = set(args.cube_numbers)
+
+        # output_files = []
+        # for p in vol_dir.iterdir():
+        #     if not p.is_file():
+        #         continue
+        #     print(p.name)
+        #     m = CUBE_RE.match(p.name)
+        #     print(m)
+        #     if int(m.group(1)) in want:
+        #         print('found the int')
+        ALL_VOL_PATHS = sorted(
+            p for p in vol_dir.iterdir()
+            if p.is_file()
+            and (m := CUBE_RE.match(p.name))
+            and int(m.group(1)) in want
+        )
+
+        # files = os.listdir(args.vol_dir)
+        # ALL_VOL_PATHS = [f for f in files if any([f"{n}_Cube_" in f for n in args.cube_numbers])]
+    else:
+        print('neither arg glob or numbers supplied')
     if not ALL_VOL_PATHS:
         raise FileNotFoundError(f"No volumes in {args.vol_dir} matching {args.glob}")
 
