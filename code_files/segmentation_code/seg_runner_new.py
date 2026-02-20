@@ -263,7 +263,10 @@ def main():
 
     segmentation_function = sp.process_bscan_1_3_26
     # segmentation_steps = sp.RPE_STEPS_1_14_26
-    segmentation_steps = sp.RPE_STEPS_1_25_26
+    # segmentation_steps = sp.RPE_STEPS_1_25_26
+    # segmentation_steps = sp.RPE_STEPS_2_2_26
+    # segmentation_steps = sp.RPE_STEPS_2_14_26
+    segmentation_steps = sp.RPE_STEPS_2_14_26_debug
     if args.debug or args.max_workers <= 1:
         # Serial, pdb-friendly path
         results = [segmentation_function(t,False,segmentation_steps) for t in work]

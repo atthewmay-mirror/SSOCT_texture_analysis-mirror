@@ -494,7 +494,11 @@ class ArrayBoard:
                                 lw=st['lw'], label=st['label'])
                         ax.legend(fontsize=6, loc='upper right')
                     else:
-                        ax.plot(line,alpha=0.7,lw=0.5,label=name)
+                        try:
+                            ax.plot(line,alpha=0.7,lw=0.5,label=name)
+                        except:
+                            print(f"failed at {name} on title={title}")
+                            raise Exception
                         ax.legend(fontsize=6, loc='upper right')
             elif kind == "plot":
                 payload(ax)

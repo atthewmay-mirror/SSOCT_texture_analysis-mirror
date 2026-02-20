@@ -7,7 +7,7 @@ import code_files.segmentation_code.segmentation_plot_utils as spu
 import code_files.file_utils as fu
 # import code_files.segmentation_utils as su
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Callable, List
+from typing import Any, Dict, Optional, Callable, List 
 import numpy as np
 import cv2
 from scipy.ndimage import gaussian_filter
@@ -94,9 +94,21 @@ class HighResContext: # Just a storage for the higher-resolution rpe processing 
     rpe_raw: Optional[np.ndarray] = None
     highfreq_diff_down_up: Optional[np.ndarray] = None
     highres_suppressed: Optional[np.ndarray] = None
+    lower_edge_of_highres_grad_tubed: Optional[np.ndarray] = None # highfreq version
     guide_image: Optional[np.ndarray] = None
     rpe_refined2: Optional[np.ndarray] = None
     rpe_smooth2: Optional[np.ndarray] = None
+
+@dataclass
+class twoLayerDPContext: # Just a storage for the higher-resolution rpe processing image steps
+    debug_bool: Optional[bool] = True
+    y1: Optional[np.ndarray] = None
+    y2: Optional[np.ndarray] = None
+    img_band: Optional[np.ndarray] = None
+    y1_rescaled: Optional[np.ndarray] = None
+    y2_rescaled: Optional[np.ndarray] = None
+    debug: dict = field(default_factory=dict)
+
 
 @dataclass
 class HypersmootherParams: # Just a storage for  The lines by which we flatten during processing pipelines
@@ -121,6 +133,7 @@ class RPEContext:
     ID: Optional[str] = None
     highres_cfg: Optional[HighResConfig] = None
     highres_ctx: Optional[HighResContext] = None
+    two_layer_dp_ctx: Optional[twoLayerDPContext] = None
     hypersmoothed_img: np.ndarray = None
     highres_smoothed_img: np.ndarray = None
     hypersmoother_params: HypersmootherParams = field(default_factory=HypersmootherParams)
@@ -488,25 +501,50 @@ def step_rpe_unsmooth(ctx: RPEContext) -> RPEContext:
 
 def step_rpe_highres_unsmooth(ctx: RPEContext) -> RPEContext:
     """undoes the hypersmoothing for the lines used in the highres pathway. Includes the rpe_smooth which will have been flattened for this path"""
-    lines = [
+    base_lines = [
         ('highres_rpe_raw',ctx.highres_ctx.rpe_raw),
         ('highres_rpe_refined',ctx.highres_ctx.rpe_refined),
         ('highres_rpe_refined2',ctx.highres_ctx.rpe_refined2),
         ('highres_rpe_smooth2',ctx.highres_ctx.rpe_smooth2),
         ]
 
-    for item in lines:
+    # two_dp_names = ['y1', 'y2', 'y1_rescaled', 'y2_rescaled']
+    two_dp_names = ['y1_rescaled', 'y2_rescaled']
+    # print(ctx.two_layer_dp_ctx)
+    for n in two_dp_names:
+        if hasattr(ctx.two_layer_dp_ctx,n):
+            # print(f"should be adding {n}")
+            base_lines.append((n,getattr(ctx.two_layer_dp_ctx,n)))
+        
+    # print([e[0] for e in base_lines])
+
+    for item in base_lines:
         name,line = item
-        print(f"logging for flat_{name}")
+        # print(f"logging for flat_{name}")
         ctx.log_history(f'flat_{name}', line.copy())
 
-    unwarped_lines = [suf.warp_line_by_shift(line[1],ctx.hypersmoother_params.highres_smoother_shift_y_full,direction='to_orig') for line in lines] #shoudl refactor
+    # unwarped_lines = [suf.warp_line_by_shift(line[1],ctx.hypersmoother_params.highres_smoother_shift_y_full,direction='to_orig') for line in lines] #shoudl refactor
+    shift = ctx.hypersmoother_params.highres_smoother_shift_y_full
+    unwarped = {
+            name: suf.warp_line_by_shift(line, shift, direction="to_orig")
+            for name, line in base_lines
+    }
 
-    (ctx.highres_ctx.rpe_raw,
-    ctx.highres_ctx.rpe_refined,
-    ctx.highres_ctx.rpe_refined2,
-    ctx.highres_ctx.rpe_smooth2,
-    ) = unwarped_lines
+    # (ctx.highres_ctx.rpe_raw,
+    # ctx.highres_ctx.rpe_refined,
+    # ctx.highres_ctx.rpe_refined2,
+    # ctx.highres_ctx.rpe_smooth2,
+    # ) = unwarped_lines
+
+    # assign back only the ones that belong to highres_ctx
+    ctx.highres_ctx.rpe_raw      = unwarped["highres_rpe_raw"]
+    ctx.highres_ctx.rpe_refined  = unwarped["highres_rpe_refined"]
+    ctx.highres_ctx.rpe_refined2 = unwarped["highres_rpe_refined2"]
+    ctx.highres_ctx.rpe_smooth2  = unwarped["highres_rpe_smooth2"]
+
+        # if include_two_layer and getattr(ctx, "two_layer_dp_ctx", None) is not None:
+    for n in two_dp_names:
+        setattr(ctx.two_layer_dp_ctx, n, unwarped[n])
 
     return ctx
 
@@ -862,6 +900,7 @@ def step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2(ctx: RPEConte
     # ctx.highres_ctx.guide_image  = guide_image 
     ctx.highres_ctx.guide_image  = cost 
     ctx.highres_ctx.highfreq_diff_down_up = highfreq_diff_down_up
+    ctx.highres_ctx.lower_edge_of_highres_grad_tubed = lower_edge_of_highres_grad_tubed 
     ctx.highres_ctx.rpe_refined2 = rpe_refined2
     ctx.highres_ctx.rpe_smooth2 = suf.smooth_rpe_line(rpe_refined2,rigidity=25)
 
@@ -1047,6 +1086,167 @@ class helperFunctions(object):
         return ctx
 
 
+# -------------------
+# Double DP 2 layer function
+#---------------------
+def step_rpe_highres_DP_two_layer(ctx: RPEContext) -> RPEContext:
+    """
+    Debug step: run 2-surface DP sweeps on a band around the flattened line,
+    visualize in ArrayBoard.
+    """
+    import code_files.segmentation_code.two_surface_utils as tsu
+
+    AB = spu.ArrayBoard(skip=True,plt_display=False, ncols_max=5, save_tag=f"DP 2-layer step for {ctx.ID}")
+
+    # --- flatten center (your code assumes flat_rpe_smooth is constant)
+    offset_value = np.unique(ctx.flat_rpe_smooth)
+    try:
+        assert len(offset_value) == 1
+    except:
+        print(f"For some reason, the len(offset_value) != 1. Instead, its {len(offset_value)}")
+    offset_value = float(offset_value[0])
+
+    img_band_radius = 30
+    r0 = int(max(0, offset_value - img_band_radius))
+    r1 = int(min(ctx.highres_ctx.lower_edge_of_tubed.shape[0], offset_value + img_band_radius))
+
+    img_full = ctx.highres_ctx.lower_edge_of_tubed
+    img_band = img_full[r0:r1, :]
+
+    # “gradient image as source” (simple vertical abs-grad; replace with your preferred)
+    # dy = np.diff(img_band, axis=0, prepend=img_band[[0], :])
+    # grad_band = np.abs(dy)
+
+    # Costs: use same pipeline but different sources
+    cost_int = tsu.make_cost_from_img(img_band, mode="inv_colmax")
+
+    # --- build a param sweep
+
+    # determined that 
+    # 2/12 params
+    # base = dict(
+    #     dmin=10, dmax=40,
+    #     max_step1=1, max_step2=1,
+    #     lambda1=0.6, lambda2=0.6,
+
+    #     # new behavior (NMS-based)
+    #     prefer_lower_on_single=True,
+    #     single_kappa=0.1,          # still the main knob
+    #     peak_sigma=1,
+    #     peak_distance= 5,
+    #     peak_prominance = 0.05, # again if sweep later, refactor into config
+
+    #     # optional extras
+    #     sep_gamma=0.0,
+    #     depth_a1=0.0,
+    #     depth_a2=0.0,
+    # )
+
+    # 2/16 params
+    base = dict(
+        dmin=10, dmax=40,
+        max_step1=1, max_step2=1,
+        lambda1=0.6, lambda2=0.6,
+
+        # new behavior (NMS-based)
+        prefer_lower_on_single=True,
+        single_kappa=0.4,          # still the main knob
+        kappa_mode = 'reweight',
+        darkness_barrier_factor = 0,
+        peak_sigma=1,
+        peak_distance= 5,
+        peak_prominance = 0.05, # again if sweep later, refactor into config
+
+        # optional extras
+        sep_gamma=0.0,
+        depth_a1=0.0,
+        depth_a2=0.0,
+    )
+ 
+
+
+    # --- run sweeps on intensity and gradient sources
+    y1, y2, dbg = tsu.run_two_surface_DP(cost_int, cost_int, return_debug=True, **base)
+    def rescale(y):  
+        return y - img_band_radius + offset_value
+    y1_rescaled,y2_rescaled = rescale(y1),rescale(y2)
+    # --- visuals (your usual context panels)
+    AB.add(ctx.original_image, title="original")
+    AB.add(ctx.highres_ctx.diff_down_up, title="input (diff_down_up)")
+    AB.add(ctx.highres_ctx.lower_edge_of_tubed, lines={"rpe_flat": ctx.flat_rpe_smooth}, title="lower_edge_of_tubed + flat")
+
+    # band source images
+    AB.add(img_band, lines={'y1':y1,'y2':y2},title="img_band (intensity)")
+    # AB.add(ctx.highres_ctx.diff_down_up, lines={"current final": ctx.highres_ctx.rpe_refined2}, title="current performance")
+    AB.add(ctx.highres_smoothed_img, lines={"current final": ctx.highres_ctx.rpe_refined2,'y1':y1_rescaled,'y2':y2_rescaled}, title="current performance")
+    AB.render()
+    ctx.two_layer_dp_ctx.img_band = img_band
+    ctx.two_layer_dp_ctx.y1 = y1
+    ctx.two_layer_dp_ctx.y2 = y2
+    ctx.two_layer_dp_ctx.y1_rescaled = y1_rescaled
+    ctx.two_layer_dp_ctx.y2_rescaled = y2_rescaled
+    if ctx.two_layer_dp_ctx.debug_bool:
+        ctx.two_layer_dp_ctx.debug = dbg
+    return ctx
+
+def step_rpe_endpoint_plot(ctx: RPEContext) -> RPEContext:
+    """do some plotting to summarize the pathway"""
+    AB = spu.ArrayBoard(skip=False,plt_display=False,save_tag=f"final_plot_step_{ctx.ID}")
+    # Add the RPE plots
+    # if 'gradient_line' in ctx_rpe.hypersmoother_params.hypersmoother_path_extras:
+        # AB.add(ctx_rpe.original_image,lines={'hypersmoothed':ctx_rpe.hypersmoother_params.hypersmoother_path,'line via upgrad':ctx_rpe.hypersmoother_params.hypersmoother_path_extras['gradient_line']},title="original")
+    AB.add(ctx.original_image,lines={'hypersmoothed':ctx.hypersmoother_params.hypersmoother_path},title="original")
+    AB.add(ctx.hypersmoother_params.coarse_hypersmoothed_img,title="hypersmooth_coarse")
+    AB.add(ctx.hypersmoothed_img,title="hypersmoothed_img")
+    AB.add(ctx.downsampled_img,title="downsampled_img")
+    AB.add(ctx.peak_suppressed,title="original_peak_suppressed")
+    AB.add(ctx.peak_suppressed,title="peak_suppressed")
+    AB.add(ctx.prob,title="prob")
+    AB.add(ctx.edge,title="edge")
+    AB.add(ctx.guided_cost_raw,title="guided_cost_raw")
+    AB.add(ctx.guided_cost_raw_tube_smoothed,title="guided_cost_raw_tube_smoothed")
+    AB.add(ctx.original_image,lines = {"hypersmoothed":ctx.hypersmoother_params.hypersmoother_path, "rpe_smooth":ctx.rpe_smooth},title="original with rpe_smooth")
+    # now the highres stuff
+    AB.add(ctx.highres_ctx.diff_down_up,title="buggy highfreq_diff_down_up")
+    AB.add(ctx.highres_ctx.lower_edge_of_tubed,title="lower_edge_of_tubed")
+    if hasattr(ctx,'highres_suppressed'): # A logged history version
+        AB.add(ctx.highres_suppressed,title="tubed_and_suppressed")
+    AB.add(ctx.highres_ctx.lower_edge_of_tubed,lines = {'rpe_flat':ctx.flat_rpe_smooth,"rpe_raw":ctx.flat_highres_rpe_raw,"rpe_refined":ctx.flat_highres_rpe_refined},title="lower_edge_of_tubed with rpe raw (lower edge) and refined with DP")
+    
+    AB.add(ctx.highres_ctx.lower_edge_of_tubed,lines = {"rpe_raw":ctx.flat_highres_rpe_raw,"rpe_refined":ctx.flat_highres_rpe_refined},title="lower_edge_of_tubed with rpe raw (lower edge) and refined with DP")
+    AB.add(ctx.highres_ctx.highfreq_diff_down_up,title="highest-res gradient")
+    AB.add(ctx.highres_ctx.guide_image,title="DP_guide_img")
+
+    # Now add the two-layer stuff
+    if ctx.two_layer_dp_ctx.debug:
+        print("adding debug info")
+        dbg = ctx.two_layer_dp_ctx.debug
+        peaks = dbg['peaks']
+        peak_img = spu.overlay_peaks_on_image(ctx.two_layer_dp_ctx.img_band,peaks)
+        AB.add(peak_img,  title='2-layer DP peak img')
+        # AB.add(ctx.two_layer_dp_ctx.debug,lines = {'y1':ctx.two_layer_dp_ctx.y1,'y2': ctx.two_layer_dp_ctx.y2},title='img_band')
+    AB.add(ctx.two_layer_dp_ctx.img_band,lines = {'y1':ctx.two_layer_dp_ctx.y1,'y2': ctx.two_layer_dp_ctx.y2},title='img_band')
+
+    # Summarizing original imgs
+    AB.add(ctx.original_image,lines = {"hypersmoothed":ctx.hypersmoother_params.hypersmoother_path,
+                                            "rpe_smooth":ctx.rpe_smooth,
+                                            "rpe_refined1":ctx.highres_ctx.rpe_refined,
+                                            "rpe_refined2":ctx.highres_ctx.rpe_refined2,
+                                            "rpe_smooth2":ctx.highres_ctx.rpe_smooth2,
+                                            },title="Original with all lines")
+
+    AB.add(ctx.original_image,lines = { 
+
+                                            "rpe_smooth":ctx.rpe_smooth,
+                                        "two_layer_y1":ctx.two_layer_dp_ctx.y1_rescaled,
+                                        "two_layer_y2":ctx.two_layer_dp_ctx.y2_rescaled,
+                                        "rpe_smooth2":ctx.highres_ctx.rpe_smooth2,
+                                        },title="Original with two-layer lines")
+    AB.render()
+    raise Exception("endpoint plotting complete. Terminating here!")
+    # return ctx
+    
+
 
 # -------------------
 # GS Functions
@@ -1067,39 +1267,479 @@ def step_rpe_highres_GS(ctx: RPEContext) -> RPEContext:
 
 def step_rpe_highres_DP2(ctx: RPEContext) -> RPEContext:
     """perform a single GS"""
-    AB = spu.ArrayBoard(plt_display=False,save_tag="GS_testing")
+    AB = spu.ArrayBoard(plt_display=False,ncols_max=5, save_tag=f"DP2 testing for {ctx.ID}")
     value = np.unique(ctx.flat_rpe_smooth)
     assert len(value)==1
     value = value[0]
-    radius = 40
+    radius = 30
     print(value-radius)
-    img_band = ctx.highres_ctx.highres_suppressed[int(value-radius):int(value+radius),:]
-    # _ = spu.sweep_to_arrayboard(AB,fn = suf.run_two_surface_DP,
-    #                         base_kwargs={'cost1':1-img_band,'cost2':1-img_band, 'lambda1':0.01, 'lambda2':0.01, 'max_step1':1, 'max_step2':1},
-    #                         grid={'dmin':[4,10,20]},
-    #                         )
+    # img_to_process = ctx.highres_ctx.highres_suppressed
+    img_to_process = ctx.highres_ctx.lower_edge_of_tubed
+    img_band = img_to_process[int(value-radius):int(value+radius),:]
+
     lines_to_add = {}
     def loop_contents(d_min):
-        y1, y2 = suf.run_two_surface_DP(1-img_band, 1-img_band, dmin=d_min, dmax=50, lambda1=0.01, lambda2=0.01,max_step1=1,max_step2=1)
+        y1, y2 = suf.run_two_surface_DP(1-img_band, 1-img_band, dmin=10, dmax=40, lambda1=0.01, lambda2=0.01,max_step1=1,max_step2=1)
         return d_min,y1,y2
     
-    results = Parallel(n_jobs=-1)(delayed(loop_contents)(d) for d in [4,10])
+    results = Parallel(n_jobs=8)(delayed(loop_contents)(d) for d in [10])
+    y1,y2 = results[0][1],results[0][2]
     for r in results:
-        lines_to_add[f'y1_dmin={r[0]}']=r[1]
-        lines_to_add[f'y2_dmin={r[0]}']=r[2]
+        lines_to_add[f'y1_dmin={r[0]}']=r[1].copy()
+        lines_to_add[f'y2_dmin={r[0]}']=r[2].copy()
     
 
-    AB.add(img_band,lines=lines_to_add,title = 'img_band_with_lines')
-    AB.add(ctx.highres_ctx.diff_down_up,title = 'lower edge of tubed')
+    AB.add(ctx.original_image,title = 'original')
+    AB.add(ctx.highres_ctx.highfreq_diff_down_up,title = 'highest_freq_diff')
+    AB.add(ctx.highres_ctx.diff_down_up,title = 'input')
     AB.add(ctx.highres_ctx.lower_edge_of_tubed,lines = {'rpe_flat':ctx.flat_rpe_smooth},title = 'lower edge of tubed')
-    for k,v in lines_to_add.items():
-        lines_to_add[k] = v-radius+value
-    AB.add(ctx.highres_ctx.highres_suppressed,lines = lines_to_add,title = 'input')
+    AB.add(ctx.highres_ctx.highres_suppressed,title = 'highres suppressed')
+    from copy import deepcopy
+    lines_to_add_adjusted = deepcopy(lines_to_add)
+    for k,v in lines_to_add_adjusted.items():
+        lines_to_add_adjusted[k] = v-radius+value
+    AB.add(img_band,lines=lines_to_add,title = 'img_band_with_lines')
+    AB.add(img_to_process,lines = lines_to_add_adjusted,title = 'line generating image with lines')
+    AB.add(ctx.highres_ctx.diff_down_up,lines = lines_to_add_adjusted,title = 'input with lines')
+    AB.add(ctx.highres_ctx.diff_down_up,lines = {'current final':ctx.highres_ctx.rpe_refined2},title = 'current performance')
+    
+
+    # Eval goodness of fit
+    # Get my peaks
+    peaks = suf.peakSuppressor.EZ_RPE_peak_suppression_pipeline(ctx.highres_ctx.lower_edge_of_tubed,ctx.highres_ctx.lower_edge_of_tubed,ilm_line=None,**{'sigma':1,
+                                                                                                                        'peak_distance':5,
+                                                                                                                        'peak_prominance':0.05}) # again if sweep later, refactor into config
+
+    OUT_peak_img = spu.overlay_peaks_on_image(ctx.highres_ctx.lower_edge_of_tubed,peaks=peaks) # debug only, keepign in sweeper function
+    AB.add(OUT_peak_img,title="peaks here")
+
+    from scipy.ndimage import median_filter,uniform_filter1d
+    # for title,x in [["suppressed",ctx.highres_ctx.highres_suppressed],["tubed_only",ctx.highres_ctx.lower_edge_of_tubed]]:
+    for title,x in [["tubed_only",ctx.highres_ctx.lower_edge_of_tubed]]:
+        den = np.max(x, axis=0, keepdims=True)   # shape (1, 512)
+        normed_eval_img = x / (den + 1e-8)
+        gof,parts = suf.two_line_gof_from_peaks_and_gap(normed_eval_img,y1-radius+value,y2-radius+value,peaks=peaks,dmin=10,return_parts=True,peak_tol=3)
+        
+
+        def plot_parts_norm(ax,parts,filter_type,norm=True):
+            for k,v in parts.items():
+                if len(v)!=512:
+                    continue
+                if norm:
+                    v_norm = v/np.max(v)
+                else:
+                    v_norm = v
+                if filter_type == 'mean':
+                    y_med = uniform_filter1d(v_norm, size=50, mode="nearest")
+                elif filter_type == 'median':
+                    y_med = median_filter(v_norm, size=25, mode="nearest")
+                    print("using median filter")
+                else:
+                    raise Exception("must supply filter type")
+                ax.plot(y_med,alpha=0.5,linewidth=0.8,label=f"{k}, range=[{round(np.min(v),2)},{round(np.max(v),2)}]")
+            ax.legend(fontsize=4, frameon=False, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+
+        def plot_simple(ax,plot_dict):
+            for k,v in plot_dict.items():
+                ax.plot(v,alpha=0.5,linewidth=0.8,label=f"{k}")
+                ax.legend(fontsize=4, frameon=False, loc="upper left", bbox_to_anchor=(1.02, 1.0))
+        # for i,subparts_k in enumerate([[ 'peak_score', 'pin_score', 'dist1', 'dist2'],
+
+        # def compute_product(parts,k1,k2,filter_type,filter_width,return_metric=False):
+        #     """modifies parts dict in place"""
+        #     if filter_type == 'median':
+        #         filt = lambda v_norm,w=filter_width: median_filter(v_norm, size=w, mode="nearest")
+        #     elif filter_type == 'mean':
+        #         filt = lambda v_norm,w=filter_width: uniform_filter1d(v_norm, size=w, mode="nearest")
+        #     f1 = filt(parts[k1])
+        #     f2 = filt(parts[k2])
+        #     prod = f1*f2
+        #     if return_metric:
+        #         return prod
+        #     parts[f"{k1}_*_{k2}"] = prod
+
+        # compute_product(parts,'peak_score','intensity_score','median',50)
+
+        for i,subparts_k in enumerate([[ 'peak_score', 'dist1', 'dist2'],
+                    # [ 'parallel_score', 'gap', 'gap_std'],
+                    [ 'intensity1', 'intensity2', 'intensity_score']]):
+            subparts = {k: parts[k] for k in subparts_k}
+            # filter_type = 'median' if i == 0 else 'mean'
+            filter_type = 'median'
+            AB.add_plot(lambda ax, sp=deepcopy(subparts),ft=filter_type: plot_parts_norm(ax, sp,ft),
+                        title=f'gof parts with {title}, filter={filter_type}')
+        
+        peak_inten,peak_inten_narrowed,mask = suf.GOFProcessing.EZ_inclusion_selection(parts)
+        plot_dict = {'peak_inten':peak_inten, 'peak_inten_narrowed':peak_inten_narrowed, 'mask': mask}
+        AB.add_plot(lambda ax: plot_simple(ax,plot_dict),
+                    title=f'gof processed')
+            
+
+
+            
+
     AB.render()
     raise Exception
 
 
+###############
+def step_rpe_highres_DP2_debug(ctx: RPEContext) -> RPEContext:
+    """
+    Debug step: run 2-surface DP sweeps on a band around the flattened line,
+    visualize in ArrayBoard.
+    """
+    import code_files.segmentation_code.segmentation_plot_utils as spu
+    import numpy as np
+    import code_files.segmentation_code.two_surface_utils as tsu
 
+    AB = spu.ArrayBoard(plt_display=False, ncols_max=5, save_tag=f"DP2 dbf debug testing for {ctx.ID}")
+
+    # --- flatten center (your code assumes flat_rpe_smooth is constant)
+    offset_value = np.unique(ctx.flat_rpe_smooth)
+    assert len(offset_value) == 1
+    offset_value = float(offset_value[0])
+
+    img_band_radius = 30
+    r0 = int(max(0, offset_value - img_band_radius))
+    r1 = int(min(ctx.highres_ctx.lower_edge_of_tubed.shape[0], offset_value + img_band_radius))
+
+   # --- build a param sweep
+    AB.add(ctx.original_image, title="original")
+    AB.add(ctx.highres_ctx.diff_down_up, title="input (diff_down_up)")
+    # AB.add(ctx.highres_ctx.lower_edge_of_tubed, lines={"rpe_flat": ctx.flat_rpe_smooth}, title="lower_edge_of_tubed + flat")
+    AB.add(ctx.highres_ctx.lower_edge_of_tubed, title="lower_edge_of_tubed + flat")
+    AB.add(ctx.highres_ctx.lower_edge_of_highres_grad_tubed, title="highfreq lower edge of tube flat")
+    
+
+    base = dict(
+        dmin=10, dmax=40,
+        max_step1=1, max_step2=1,
+        lambda1=0.01, lambda2=0.01,
+
+        # new behavior (NMS-based)
+        prefer_lower_on_single=True,
+        single_kappa=0.2,          # still the main knob
+        peak_sigma=1,
+        peak_distance= 5,
+        peak_prominance = 0.05, # again if sweep later, refactor into config
+
+        # optional extras
+        sep_gamma=0.0,
+        depth_a1=0.0,
+        depth_a2=0.0,
+    )
+
+    
+    """
+    param_list = []
+    for dmin in [10]:
+        # for lam in [0.2,0.4,0.6,1]:
+        # for img_title,img_full in [('lower res tube',ctx.highres_ctx.lower_edge_of_tubed),('higher res tube',ctx.highres_ctx.lower_edge_of_highres_grad_tubed)]: # A failed experiement for now!
+        for img_title,img_full in [('lower res tube',ctx.highres_ctx.lower_edge_of_tubed)]: 
+            for peak_prominance in [0.05]:
+                for lam in [0.6]:
+                    for cost_mode in ['inv_colmax']: # seems better?
+                    # for cost_mode in ['inv_colmax','inv_global']:
+                        for kappa_mode in ['reweight']:
+                        # for kappa_mode in ['abs_dist','reweight']:
+                            # for kappa in [0.4,0.5,0.6]:
+                            for kappa in [0.4,0.6]:
+                                for barrier_cost_params in [{'alpha':a} for a in [2,4,6]]:
+                                    # for dbf in [0,0.1,0.3,0.5]:
+                                    for dbf in [0,0.3,0.4,0.7]:
+                            # for nms_thresh in [0.01,0.1]:
+                            #     for nms_radius in [4,10]:
+
+                                        # img_full = ctx.highres_ctx.lower_edge_of_tubed
+                                        # img_full = img_tuple[1]
+                                        img_band = img_full[r0:r1, :]
+                                        # Costs: use same pipeline but different sources
+                                        cost_int = tsu.make_cost_from_img(img_band, mode=cost_mode)
+
+
+                                        p = dict(base)
+                                        p['cost1'] = cost_int
+                                        p['cost2'] = cost_int
+                                        p["dmin"] = dmin
+                                        p["lambda1"] = lam
+                                        p["lambda2"] = lam
+                                        p["darkness_barrier_factor"] = dbf
+                                        p["kappa_mode"] = kappa_mode
+                                        p["cost_mode"] = cost_mode
+                                        p["input_img"] = img_title
+                                        p["peak_prominance"] = peak_prominance
+                                        p["barrier_cost_params"] = barrier_cost_params
+                                        # p["max_step1"] = max_step
+                                        # p["max_step2"] = max_step
+                                        p["single_kappa"] = kappa
+                                        param_list.append(p)
+    """
+
+
+    # Trying to debug the dbf and exponential form
+    param_list = []
+    for dmin in [10]:
+        # for lam in [0.2,0.4,0.6,1]:
+        # for img_title,img_full in [('lower res tube',ctx.highres_ctx.lower_edge_of_tubed),('higher res tube',ctx.highres_ctx.lower_edge_of_highres_grad_tubed)]: # A failed experiement for now!
+        for img_title,img_full in [('lower res tube',ctx.highres_ctx.lower_edge_of_tubed)]: 
+            for peak_prominance in [0.05]:
+                for lam in [0.6]:
+                    for cost_mode in ['inv_colmax']: # seems better?
+                    # for cost_mode in ['inv_colmax','inv_global']:
+                        for kappa_mode in ['reweight']:
+                        # for kappa_mode in ['abs_dist','reweight']:
+                            # for kappa in [0.4,0.5,0.6]:
+                            for kappa in [0.6]:
+                                for barrier_cost_params in [{'alpha':a} for a in [2,6,10,20]]:
+                                    # for dbf in [0,0.1,0.3,0.5]:
+                                    for dbf in [0.5]:
+                            # for nms_thresh in [0.01,0.1]:
+                            #     for nms_radius in [4,10]:
+
+                                        # img_full = ctx.highres_ctx.lower_edge_of_tubed
+                                        # img_full = img_tuple[1]
+                                        img_band = img_full[r0:r1, :]
+                                        # Costs: use same pipeline but different sources
+                                        cost_int = tsu.make_cost_from_img(img_band, mode=cost_mode)
+
+
+                                        p = dict(base)
+                                        p['cost1'] = cost_int
+                                        p['cost2'] = cost_int
+                                        p["dmin"] = dmin
+                                        p["lambda1"] = lam
+                                        p["lambda2"] = lam
+                                        p["darkness_barrier_factor"] = dbf
+                                        p["kappa_mode"] = kappa_mode
+                                        p["cost_mode"] = cost_mode
+                                        p["input_img"] = img_title
+                                        p["peak_prominance"] = peak_prominance
+                                        p["barrier_cost_params"] = barrier_cost_params
+                                        # p["max_step1"] = max_step
+                                        # p["max_step2"] = max_step
+                                        p["single_kappa"] = kappa
+                                        param_list.append(p)
+
+    # likley good params for two algo
+    """
+    base = dict(
+        dmin=10, dmax=40,
+        max_step1=1, max_step2=1,
+        lambda1=0.6, lambda2=0.6,
+
+        # new behavior (NMS-based)
+        prefer_lower_on_single=True,
+        single_kappa=0.4,          # still the main knob
+        kappa_mode = 'reweight',
+        darkness_barrier_factor = 0,
+        peak_sigma=1,
+        peak_distance= 5,
+        peak_prominance = 0.05, # again if sweep later, refactor into config
+
+        # optional extras
+        sep_gamma=0.0,
+        depth_a1=0.0,
+        depth_a2=0.0,
+    )
+    """
+ 
+
+
+
+        
+    # param_list = []
+    # for dmin in [10]:
+    #     # for lam in [0.2,0.4,0.6,1]:
+    #     for img_title,img_full in [('lower res tube',ctx.highres_ctx.lower_edge_of_tubed),('higher res tube',ctx.highres_ctx.lower_edge_of_highres_grad_tubed)]:
+    #         for lam in [0.1]:
+    #             for cost_mode in ['inv_colmax']: # seems better?
+    #             # for cost_mode in ['inv_colmax','inv_global']:
+    #                 for kappa_mode in ['reweight']:
+    #                 # for kappa_mode in ['abs_dist','reweight']:
+    #                     for kappa in [0.05]:
+    #                 # for dbf in [0.1,0.2,0.3,0.4,0.5]:
+    #                 # for nms_thresh in [0.01,0.1]:
+    #                 #     for nms_radius in [4,10]:
+
+    #                         # img_full = ctx.highres_ctx.lower_edge_of_tubed
+    #                         # img_full = img_tuple[1]
+    #                         img_band = img_full[r0:r1, :]
+    #                         # Costs: use same pipeline but different sources
+    #                         cost_int = tsu.make_cost_from_img(img_band, mode=cost_mode)
+
+
+    #                         p = dict(base)
+    #                         p['cost1'] = cost_int
+    #                         p['cost2'] = cost_int
+    #                         p["dmin"] = dmin
+    #                         p["lambda1"] = lam
+    #                         p["lambda2"] = lam
+    #                         # p["darkness_barrier_factor"] = dbf
+    #                         p["kappa_mode"] = kappa_mode
+    #                         p["cost_mode"] = cost_mode
+    #                         p["input_img"] = img_title
+
+    #                         # p["max_step1"] = max_step
+    #                         # p["max_step2"] = max_step
+    #                         p["single_kappa"] = kappa
+    #                         param_list.append(p)
+
+
+
+
+
+    # --- run sweeps on intensity and gradient sources
+    # results_int = tsu.sweep_two_surface_dp(cost_int, cost_int, param_list, n_jobs=1)
+    results_int = tsu.sweep_two_surface_dp(param_list, n_jobs=8)
+    # results_grad = sweep_two_surface_dp(cost_grad, cost_grad, param_list, n_jobs=8)
+    AB.add(img_band, title="img_band (intensity)")
+    # AB.add(1-cost_int, title="1-cost calc from img band")
+
+    # --- visuals (your usual context panels)
+
+    # AB.add(ctx.highres_ctx.lower_edge_of_tubed, lines={"rpe_flat": ctx.flat_rpe_smooth}, title="lower_edge_of_tubed + flat")
+    # AB.add(ctx.highres_ctx.highres_suppressed, title="highres_suppressed")
+
+    # band source images
+
+    # overlay best few results (by final cost)
+    # results_int_sorted = sorted(results_int, key=lambda r: r["debug"].get("final_cost", np.inf))
+    results_int_sorted = results_int
+    # results_grad_sorted = sorted(results_grad, key=lambda r: r["debug"].get("final_cost", np.inf))
+
+    tsu.add_dp_sweep_to_arrayboard(
+        AB,
+        img_band=1-cost_int, # A better version
+        # img_band=img_band,
+        img_full=img_full,
+        band_top=r0,
+        results=results_int_sorted,
+        title_prefix="INT",
+        max_overlays=6,
+        offset_value=offset_value,
+        img_band_radius=img_band_radius,
+        relevant_names=["lambda2",'kappa_mode',"single_kappa",'cost_mode','input_img','darkness_barrier_factor','barrier_cost_params','peak_prominance']
+    )
+
+    # add_dp_sweep_to_arrayboard(
+    #     AB,
+    #     img_band=grad_band,
+    #     img_full=img_full,
+    #     band_top=r0,
+    #     results=results_grad_sorted,
+    #     title_prefix="GRAD",
+    #     max_overlays=6,
+    # )
+
+    # Compare to current performance
+    AB.add(ctx.highres_ctx.diff_down_up, lines={"current final": ctx.highres_ctx.rpe_refined2}, title="current performance")
+
+    AB.render()
+    raise Exception("DP2 debug stop")
+###############
+
+
+class doublePeakProcessors():
+    """likely too much a pain, too brittle"""
+    @staticmethod
+    def keep_confluent_regions(metric,threshold,percentile,required_width):
+        """keep those pixels where the percentile quantile of requrieted_width around them is above threhsold."""
+        # fill here
+        pass
+
+    @staticmethod
+    def zero_narrow(metric,zeroing_metric,low_threshold,low_percentile):
+        """we have now selected regions for inclusion based on some metric, but i think the intensity1 metric
+        will drop close to zero for spurious selections (choroid grabs). I would intend to decrease regions next to very low regions. 
+        Like take a window of some size: if the say 6th percentile (one above low percentile) is within that window is below some 'low_threshold', then that entire window gets cut by some factor or something.
+        This would effectively shink peaks of spurious inclusion"""
+        # fill here
+        pass
+
+    @staticmethod
+    def EZ_inclusion_selection(parts,threshold,percentile,required_width):
+        """We will include as EZ/RPE regions (double DP), places where the say 5th percnetile (quantile) of the composite score (metric)
+        is > some threshold for a span ≥ required_width.  The idea here is to cut down adjacent to regions of lower signal strength of zero"""
+        EZ_selection_metric = compute_product(parts,'peak_score','intensity_score','median',50,True)
+        EZ_selection_metric = zero_narrow(EZ_selection_metric,parts['intensity1'],low_threshold=0.1,low_percentile=0.05)
+
+        true_false_regions = keep_confluent_regions(EZ_selection_metric,threshold,percentile,required_width)
+        return  true_false_regions 
+
+
+
+def step_rpe_highres_grad_testing(ctx: RPEContext) -> RPEContext:
+    """sadly this is a failed experiment. MAkes sense. The upward grad picks up the lower edge of bright lines. this gets both the choroid and the RPE.
+    no free lunch here. """
+    """testing some better processing"""
+    from textwrap import fill
+
+    img = ctx.highres_smoothed_img # the orignal but flattened
+
+    def zero_above_line(img2d: np.ndarray, y_line: np.ndarray):
+        """
+        img2d: (H, W)
+        y_line: (W,) integer y for each column x
+        sets img2d[y < y_line[x], x] = 0
+        """
+        H, W = img2d.shape
+        y_line = np.asarray(y_line)
+        y_line = np.clip(y_line.astype(int), 0, H)   # allow H => zero entire column above H (i.e. nothing)
+
+        rows = np.arange(H)[:, None]                 # (H,1)
+        mask_above = rows < y_line[None, :]          # (H,W)
+        img2d[mask_above] = 0
+        return img2d
+
+    def to01(img: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        img = np.asarray(img)
+        mn = np.nanmin(img)
+        mx = np.nanmax(img)
+        return (img - mn) / (mx - mn + eps)
+
+    def loop_contents(d):
+        enh_up = suf._boundary_enhance(img,d['kernel_size'],dark2bright=True,blur_ksize=d['blur_ksize'])
+        # blurred_img = suf._blur_image(enh_up,d['blur_k_x'],d['blur_k_y'])
+        blurred_img = suf.downward_horizontal_blur2(enh_up,d['blur_k_x'],d['blur_k_y'])
+        blurred_img = to01(blurred_img)
+        blurred_img_zeroed = zero_above_line(blurred_img,ctx.highres_ctx.rpe_smooth2)
+        source_img = to01(ctx.highres_ctx.diff_down_up )
+        diff_img = source_img - blurred_img_zeroed
+        diff_img[diff_img<0] = 0
+        diff_img /= (diff_img.max() + 1e-6)
+
+        return d,enh_up,blurred_img,diff_img
+
+        
+    
+    results = Parallel(n_jobs=2)(delayed(loop_contents)({'kernel_size':ks,'blur_ksize':bs,'blur_k_x':bkx,'blur_k_y':bky}) 
+                                 for ks in [50] for bs in [50] for bkx in [30,50,100] for bky in [20,30,100])
+                                #  for ks in [40] for bs in [50] for bkx in [20] for bky in [10])
+    AB = spu.ArrayBoard(plt_display=False,save_tag=f'other grad testing {ctx.ID}')
+    AB.add(ctx.highres_smoothed_img,title='original')
+    AB.add(ctx.highres_smoothed_img,lines={'rpe_smooth2':ctx.highres_ctx.rpe_smooth2,
+                                           'rpe_smooth':ctx.flat_rpe_smooth},title='original with line')
+
+    AB.add(ctx.highres_ctx.diff_down_up,title='input to second round')
+    AB.add(ctx.highres_ctx.diff_down_up,lines={'rpe_smooth2':ctx.highres_ctx.rpe_smooth2,
+                                           'rpe_smooth':ctx.flat_rpe_smooth},title='input to second round')
+    # AB.add(ctx.highres_ctx.highfreq_diff_down_up,lines={'rpe_smooth2':ctx.highres_ctx.rpe_smooth2,
+                                        #    'rpe_smooth':ctx.flat_rpe_smooth},title='input to second round')
+    # for r in results:
+    #     d = r[0]
+    #     AB.add(r[1],lines={'rpe_smooth2':ctx.highres_ctx.rpe_refined2},title=f'down_kb={r[0]}')
+    #     AB.add(r[2],lines={'rpe_smooth2':ctx.highres_ctx.rpe_refined2},title=f'up_kb={r[0]}')
+    #     AB.add(r[3],lines={'rpe_smooth2':ctx.highres_ctx.rpe_refined2},title=f'left_kb={r[0]}')
+    #     AB.add(r[4],lines={'rpe_smooth2':ctx.highres_ctx.rpe_refined2},title=f'right_kb={r[0]}')
+
+    for r in results:
+        d = r[0]
+        AB.add(r[1],lines={'rpe_smooth2':ctx.highres_ctx.rpe_refined2},title=fill(f'enh_up. d={d}',width=25))
+        AB.add(r[2],lines={'rpe_smooth2':ctx.highres_ctx.rpe_refined2},title=fill(f'blurred. d={d}',width=25))
+        AB.add(r[3],lines={'rpe_smooth2':ctx.highres_ctx.rpe_refined2},title=fill(f'Diff. d={d}',width=25))
+    AB.render()
+
+    return ctx
 
 
 
@@ -1230,5 +1870,4 @@ def step_ilm_upsample(ctx: ILMContext) -> ILMContext:
     ctx.ilm_raw = ilm_raw
     ctx.ilm_smooth = ilm_smooth
     return ctx
-
 

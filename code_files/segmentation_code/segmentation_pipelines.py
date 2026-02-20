@@ -130,12 +130,14 @@ def process_bscan_1_3_26(idx_and_img,production_mode,rpe_seg_steps):
     rpe_config = ssf.RPEConfig()
     highres_rpe_config = ssf.HighResConfig()
     highres_rpe_context = ssf.HighResContext()
+    two_layer_dp_context  = ssf.twoLayerDPContext()
     rpe_ctx = ssf.RPEContext(idx = idx, # Idx here is the work index. That should be a valid way to tag the saved ckpt
                         ID = work_id,
                         original_image=bscan.copy(),
                         cfg=rpe_config,
                         highres_cfg=highres_rpe_config,
                         highres_ctx=highres_rpe_context,
+                        two_layer_dp_ctx=two_layer_dp_context,
                         ilm_seg=ilm_ctx.ilm_raw,
                         ONH_region=ONH_info)
     rpe_ctx = ssf.run_pipeline(rpe_ctx,steps=rpe_seg_steps)
@@ -214,12 +216,105 @@ RPE_STEPS_2_2_26: List[ssf.RPEStepFn] = [
     ssf.step_rpe_unsmooth,
     ssf.step_rpe_highres_smooth,
     ssf.step_rpe_highres_diff_enh,
-    ssf.ckpt(ssf.step_rpe_highres_peak_suppress_to_rpe_refined,overwrite=False),
+    ssf.step_rpe_highres_peak_suppress_to_rpe_refined,
+    # Steps don't have to be planned sequential
+    # ssf.ckpt(ssf.step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2,overwrite=True,save_by_ID=True),
+    ssf.step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2,
     ssf.step_rpe_highres_DP2, # Will terminate here
     # ssf.step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2,
 ] 
 
 RPE_STEPS_2_2_26 = ssf.filter_pipeline(RPE_STEPS_2_2_26 )
 
+
 # print(f"RPE_STEPS is equal to {RPE_STEPS_1_25_26 }")
 
+
+# This is a failed experiment. 
+RPE_STEPS_2_10_26: List[ssf.RPEStepFn] = [ # Exploring the addition of a horizontal gradient
+    ssf.step_rpe_init_working,
+    ssf.step_rpe_hypersmoother,
+    ssf.step_rpe_downsample_and_preprocess,
+    ssf.step_rpe_compute_enhancement,
+    ssf.step_rpe_peak_suppression,
+    ssf.step_rpe_recalculate_single_seeded_and_reseed,
+    ssf.step_rpe_paths_prob_edge,
+    ssf.step_rpe_extract_rpe_raw_and_margin,
+    ssf.step_rpe_guided_dp,
+    ssf.step_rpe_tube_smoother,
+    ssf.step_rpe_smooth_and_upsample,
+    ssf.step_rpe_unsmooth,
+    ssf.step_rpe_highres_smooth,
+    ssf.step_rpe_highres_diff_enh,
+    ssf.step_rpe_highres_peak_suppress_to_rpe_refined,
+    ssf.ckpt(ssf.step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2,overwrite=False,save_by_ID=True),
+    # ssf.step_rpe_highres_DP2, # Will terminate here
+    # ssf.step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2
+    ssf.step_rpe_highres_grad_testing,
+]
+
+RPE_STEPS_2_10_26 = ssf.filter_pipeline(RPE_STEPS_2_10_26 )
+
+
+# Testing the sticky lower line
+# Seems to work!
+RPE_STEPS_2_11_26: List[ssf.RPEStepFn] = [ # Exploring the addition of a horizontal gradient
+    ssf.step_rpe_init_working,
+    ssf.step_rpe_hypersmoother,
+    ssf.step_rpe_downsample_and_preprocess,
+    ssf.step_rpe_compute_enhancement,
+    ssf.step_rpe_peak_suppression,
+    ssf.step_rpe_recalculate_single_seeded_and_reseed,
+    ssf.step_rpe_paths_prob_edge,
+    ssf.step_rpe_extract_rpe_raw_and_margin,
+    ssf.step_rpe_guided_dp,
+    ssf.step_rpe_tube_smoother,
+    ssf.step_rpe_smooth_and_upsample,
+    ssf.step_rpe_unsmooth,
+    ssf.step_rpe_highres_smooth,
+    ssf.step_rpe_highres_diff_enh,
+    ssf.step_rpe_highres_peak_suppress_to_rpe_refined,
+    ssf.ckpt(ssf.step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2,overwrite=False,save_by_ID=True),
+    # ssf.step_rpe_highres_DP2, # Will terminate here
+    # ssf.step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2
+    # ssf.step_rpe_highres_DP2,
+    ssf.step_rpe_highres_DP_two_layer,
+]
+
+RPE_STEPS_2_11_26 = ssf.filter_pipeline(RPE_STEPS_2_11_26 )
+
+RPE_STEPS_2_12_26: List[ssf.RPEStepFn] = [ # Exploring the addition of a horizontal gradient
+    ssf.step_rpe_init_working,
+    ssf.step_rpe_hypersmoother,
+    ssf.step_rpe_downsample_and_preprocess,
+    ssf.step_rpe_compute_enhancement,
+    ssf.step_rpe_peak_suppression,
+    ssf.step_rpe_recalculate_single_seeded_and_reseed,
+    ssf.step_rpe_paths_prob_edge,
+    ssf.step_rpe_extract_rpe_raw_and_margin,
+    ssf.step_rpe_guided_dp,
+    ssf.step_rpe_tube_smoother,
+    ssf.step_rpe_smooth_and_upsample,
+    ssf.step_rpe_unsmooth,
+    ssf.step_rpe_highres_smooth,
+    ssf.step_rpe_highres_diff_enh,
+    ssf.step_rpe_highres_peak_suppress_to_rpe_refined,
+    ssf.step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2,
+    # ssf.step_rpe_highres_DP2, # Will terminate here
+    # ssf.step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2
+    # ssf.step_rpe_highres_DP2,
+    # ssf.ckpt(ssf.step_rpe_highres_DP_two_layer,overwrite=False,save_by_ID=True),
+    ssf.step_rpe_highres_DP_two_layer,
+    ssf.step_rpe_highres_unsmooth,
+    # ssf.step_rpe_endpoint_plot,
+]
+
+RPE_STEPS_2_12_26 = ssf.filter_pipeline(RPE_STEPS_2_12_26 )
+
+
+RPE_STEPS_2_14_26  = RPE_STEPS_2_12_26[:-2] + [ssf.ckpt(ssf.step_rpe_highres_DP_two_layer,overwrite=True,save_by_ID=True),ssf.step_rpe_highres_unsmooth,ssf.step_rpe_endpoint_plot]
+RPE_STEPS_2_14_26 = ssf.filter_pipeline(RPE_STEPS_2_14_26 )
+
+
+RPE_STEPS_2_14_26_debug  = RPE_STEPS_2_12_26[:-3] + [ssf.ckpt(ssf.step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2,overwrite=True,save_by_ID=True),ssf.step_rpe_highres_DP2_debug]
+RPE_STEPS_2_14_26_debug  = ssf.filter_pipeline(RPE_STEPS_2_14_26_debug  )

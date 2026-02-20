@@ -99,7 +99,6 @@ def plot_center_slices(base_dir):
 
 import numpy as np
 import matplotlib.pyplot as plt
-import random
 
 def plot_slices_with_layers(volume,layers=None, indices = range(10,20), max_cols = 7, layer_names=None,return_fig = False):
     """

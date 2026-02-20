@@ -22,10 +22,17 @@ import cv2
 def _axial_gradient(img, kernel):
     return convolve(img.astype(np.float32), kernel[:, None], mode='reflect')
 
+def _horizontal_gradient(img, kernel):
+    return convolve(img.astype(np.float32), kernel[None,:], mode='reflect')
 
-def _boundary_enhance(img, vertical_kernel_size = 4, dark2bright=True, blur_ksize=40):
+
+def _boundary_enhance(img, vertical_kernel_size = 4, dark2bright=True, blur_ksize=40,direction='axial'):
     k_up = np.array(np.concatenate([np.repeat(-1,vertical_kernel_size//2),np.repeat(1,vertical_kernel_size//2)]), dtype=np.float32)
-    g = _axial_gradient(img, k_up if dark2bright else -k_up)
+    if direction=='axial':
+        g = _axial_gradient(img, k_up if dark2bright else -k_up)
+    else:
+        assert direction == 'horizontal'
+        g = _horizontal_gradient(img, k_up if dark2bright else -k_up)
     g[g < 0] = 0
     g /= (g.max() + 1e-6) # normalize
     ctx = cv2.blur(img.astype(np.float32), (blur_ksize,blur_ksize))
@@ -334,6 +341,27 @@ def smooth_rpe_line(rpe_raw, rigidity=61, polyorder=3):
         win += 1
     return savgol_filter(rpe_raw, int(win), int(polyorder), mode='interp')
 
+def downward_horizontal_blur2(img: np.ndarray, k_rows: int, k_cols: int) -> np.ndarray:
+    """I think this is corrected..."""
+    H, W = img.shape
+    # pad_vert  = k_rows - 1
+    pad_vert  = k_rows
+    pad_horiz = k_cols // 2
+
+    padded = np.pad(img,
+                    ((pad_vert, 0), (pad_horiz, pad_horiz)),
+                    mode='edge')
+
+    # trailing vertical sum (only affects same row + rows below)
+    csum_v = padded.cumsum(axis=0, dtype=np.float32)
+    vert_sum = csum_v[k_rows : k_rows + H] - csum_v[0 : H]
+
+    # symmetric horizontal
+    csum_h = vert_sum.cumsum(axis=1, dtype=np.float32)
+    horiz_sum = csum_h[:, k_cols : k_cols + W] - csum_h[:, 0 : W]
+
+    blurred = horiz_sum / float(k_rows * k_cols)
+    return blurred
 
 
 def downward_horizontal_blur(img: np.ndarray,
@@ -2644,3 +2672,461 @@ def run_two_surface_DP(
         return y1, y2, C_prev.copy(), P1, P2
 
     return y1, y2
+
+
+
+def run_two_surface_DP2(
+    cost1: np.ndarray,              # (H,W) cost for upper surface (lower is better)
+    cost2: np.ndarray,              # (H,W) cost for lower surface
+    dmin: int,
+    dmax: int,
+    max_step1: int,
+    max_step2: int,
+    lambda1: float,
+    lambda2: float,
+    return_tables: bool = False,
+):
+    """
+    Parallel 2-surface DP with hard per-column separation bounds and first-order smoothness.
+
+    Constraints (per column j):
+      dmin <= y2[j] - y1[j] <= dmax
+      |y1[j] - y1[j-1]| <= max_step1
+      |y2[j] - y2[j-1]| <= max_step2
+
+    Objective:
+      sum_j cost1[y1[j], j] + cost2[y2[j], j]
+        + lambda1 * sum_j |y1[j]-y1[j-1]|
+        + lambda2 * sum_j |y2[j]-y2[j-1]|
+
+    Returns:
+      y1, y2 (W,) int arrays
+      optionally: C, P1, P2 where
+        C is (H,H,W) with inf for invalid pairs (prototype; memory heavy)
+        P1,P2 are predecessor row indices for backtracking
+    """
+    from tqdm import tqdm
+    if cost1.shape != cost2.shape:
+        raise ValueError(f"cost1 and cost2 must match. Got {cost1.shape} vs {cost2.shape}")
+    if cost1.ndim != 2:
+        raise ValueError("cost1/cost2 must be 2D (H,W).")
+    if dmin < 0 or dmax < dmin:
+        raise ValueError("Require 0 <= dmin <= dmax.")
+
+    H, W = cost1.shape
+    # Debug: count non-finite costs
+    n_bad1 = np.size(cost1) - np.isfinite(cost1).sum()
+    n_bad2 = np.size(cost2) - np.isfinite(cost2).sum()
+    if n_bad1 or n_bad2:
+        print(f"[DP] non-finite costs: cost1={n_bad1}, cost2={n_bad2}")
+
+    # Strongly recommended: treat NaN as +inf (unusable pixel)
+    cost1 = np.nan_to_num(cost1, nan=np.inf, posinf=np.inf, neginf=np.inf)
+    cost2 = np.nan_to_num(cost2, nan=np.inf, posinf=np.inf, neginf=np.inf)
+
+    # We'll store DP over (i1,i2) pairs. For prototype clarity, we use dense (H,H) and mask invalids.
+    C_prev = np.full((H, H), np.inf, dtype=float)
+    C_cur  = np.full((H, H), np.inf, dtype=float)
+
+    # predecessors (store prev rows for i1 and i2)
+    P1 = np.full((H, H, W), -1, dtype=int)
+    P2 = np.full((H, H, W), -1, dtype=int)
+
+    # Initialize column 0
+    for i1 in range(H):
+        i2_lo = i1 + dmin
+        i2_hi = min(H - 1, i1 + dmax)
+        if i2_lo >= H:
+            continue
+        for i2 in range(i2_lo, i2_hi + 1):
+            C_prev[i1, i2] = cost1[i1, 0] + cost2[i2, 0]
+            # P1/P2 at j=0 stay -1
+    if not np.isfinite(C_prev).any():
+        print(np.unique(cost1[:,0]))
+        print(np.unique(cost2[:,0]))
+        print(H)
+        raise RuntimeError(
+            "No feasible initial states at column 0. "
+            "Check dmin/dmax vs H and check cost1/cost2 for NaN/Inf at col 0."
+        )
+
+    # DP forward
+    for j in tqdm(range(1, W)):
+        C_cur.fill(np.inf)
+
+        for i1 in range(H):
+            i2_lo = i1 + dmin
+            i2_hi = min(H - 1, i1 + dmax)
+            if i2_lo >= H:
+                continue
+
+            # predecessor range for i1
+            k1_lo = max(0, i1 - max_step1)
+            k1_hi = min(H - 1, i1 + max_step1)
+
+            for i2 in range(i2_lo, i2_hi + 1):
+                # predecessor range for i2
+                k2_lo = max(0, i2 - max_step2)
+                k2_hi = min(H - 1, i2 + max_step2)
+
+                best_val = np.inf
+                best_k1 = -1
+                best_k2 = -1
+
+                # brute-force search in the local predecessor window
+                # (validity of (k1,k2) enforced by checking C_prev[k1,k2] < inf)
+                for k1 in range(k1_lo, k1_hi + 1):
+                    step1 = lambda1 * abs(i1 - k1)
+
+                    # for this k1, k2 must also satisfy separation at prev column:
+                    # dmin <= k2 - k1 <= dmax  =>  k2 in [k1+dmin, k1+dmax]
+                    kk2_lo = max(k2_lo, k1 + dmin)
+                    kk2_hi = min(k2_hi, k1 + dmax)
+                    if kk2_lo > kk2_hi:
+                        continue
+
+                    for k2 in range(kk2_lo, kk2_hi + 1):
+                        prev_cost = C_prev[k1, k2]
+                        if not np.isfinite(prev_cost):
+                            continue
+                        val = prev_cost + step1 + lambda2 * abs(i2 - k2)
+                        if val < best_val:
+                            best_val = val
+                            best_k1 = k1
+                            best_k2 = k2
+
+                if best_k1 >= 0:
+                    C_cur[i1, i2] = cost1[i1, j] + cost2[i2, j] + best_val
+                    P1[i1, i2, j] = best_k1
+                    P2[i1, i2, j] = best_k2
+
+        # DEBUG EARLY DISCONNECT DETECTION
+        if not np.isfinite(C_cur).any():
+            # helpful extra diagnostics
+            finite_prev = np.isfinite(C_prev).sum()
+            finite_c1 = np.isfinite(cost1[:, j]).sum()
+            finite_c2 = np.isfinite(cost2[:, j]).sum()
+            raise RuntimeError(
+                f"DP became infeasible at column {j}. "
+                f"finite_prev_pairs={finite_prev}, finite_cost1_col={finite_c1}/{H}, finite_cost2_col={finite_c2}/{H}. "
+                f"Try checking NaN/Inf in costs or that constraints/banding aren't implicitly applied upstream."
+            )
+        C_prev, C_cur = C_cur, C_prev  # swap buffers
+
+    # DEBUG
+    finite_mask = np.isfinite(C_prev)
+    if not finite_mask.any():
+        raise RuntimeError(
+            "No feasible ending state (all costs are inf) at final column. "
+            "This means the DP was infeasible by the last layer."
+        )
+
+    # pick min among finite entries only
+    end_flat = np.argmin(np.where(finite_mask, C_prev, np.inf))
+    end_i1, end_i2 = np.unravel_index(end_flat, C_prev.shape)
+
+
+    # # Pick best ending state at column W-1
+    # end_i1, end_i2 = np.unravel_index(np.argmin(C_prev), C_prev.shape)
+
+    # Backtrack
+    y1 = np.zeros(W, dtype=int)
+    y2 = np.zeros(W, dtype=int)
+    y1[-1] = int(end_i1)
+    y2[-1] = int(end_i2)
+
+    for j in range(W - 1, 0, -1):
+        k1 = P1[y1[j], y2[j], j]
+        k2 = P2[y1[j], y2[j], j]
+        
+    
+        if k1 < 0 or k2 < 0:
+            print("[DP] Backtrack failure diagnostics:")
+            print("  j:", j)
+            print("  state (y1,y2):", y1[j], y2[j])
+            # Note: at backtrack time, C_prev no longer corresponds to column j.
+            # But the pointer missing means this state was never assigned at column j.
+
+            # If this happens, the DP got stuck (constraints too tight or costs all inf)
+            raise RuntimeError(f"Backtrack failed at column {j}. Try relaxing constraints.")
+        y1[j - 1] = k1
+        y2[j - 1] = k2
+
+    if return_tables:
+        # If you really want full tables, we can reconstruct them, but it's memory heavy.
+        # For now return the predecessor cubes and final C_prev snapshot.
+        return y1, y2, C_prev.copy(), P1, P2
+
+    return y1, y2
+
+
+
+import numpy as np
+
+
+import numpy as np
+
+def two_line_gof_from_peaks_and_gap(
+    peak_source_img: np.ndarray,   # (H,W) image to run peak detection on (e.g. img or enh)
+    y1: np.ndarray,                # (W,)
+    y2: np.ndarray,                # (W,)
+    *,
+    dmin: int,
+    dmax: int | None = None,       # optional; if provided, also penalize being pinned at dmax
+    peaks: np.ndarray | None = None,
+    # peak detection params (passed to your peakSuppressor)
+    sigma: float = 2.0,
+    peak_prominence: float = 0.02,
+    peak_distance: int = 5,
+    ilm_line: np.ndarray | None = None,
+    min_offset: int = -15,
+    # scoring params
+    peak_tol: int = 2,             # px tolerance to call it "on a peak"
+    gap_margin: float = 2.0,       # how far above dmin you need to be to avoid "pinned" penalty
+    var_win: int = 25,             # running window for gap variance (odd is nice)
+    var_tau: float = 1.0,          # px; how much gap std is tolerated
+    return_parts: bool = False,
+):
+    """
+    Returns:
+      gof: (W,) float32 in [0,1]
+        ~1 => both lines sit on peaks AND gap is not pinned AND gap is locally stable.
+    """
+    peak_source_img = np.asarray(peak_source_img, dtype=float)
+    H, W = peak_source_img.shape
+    y1 = np.asarray(y1).astype(int)
+    y2 = np.asarray(y2).astype(int)
+    if y1.shape != (W,) or y2.shape != (W,):
+        raise ValueError(f"y1,y2 must be shape (W,), got {y1.shape} and {y2.shape}")
+
+    # --- 1) peak detection using your library ---
+    if peaks is None:
+        print("computing peaks afresh in the gof test")
+            
+        smoothed, peaks, _ = peakSuppressor.extract_smoothed_and_peaks(
+            peak_source_img,
+            sigma=sigma,
+            peak_prominence=peak_prominence,
+            peak_distance=peak_distance,
+            ilm_line=ilm_line,
+            min_offset=min_offset,
+        )
+
+    def _dist_to_nearest_peak(p: np.ndarray, y: int) -> int:
+        if p.size == 0:
+            return 40 # A default val
+        return int(np.min(np.abs(p - y)))
+
+    # per-column peak distances
+    dist1 = np.empty(W, dtype=np.int32)
+    dist2 = np.empty(W, dtype=np.int32)
+    for j in range(W):
+        p = np.asarray(peaks[j], dtype=int)
+        dist1[j] = _dist_to_nearest_peak(p, int(np.clip(y1[j], 0, H - 1)))
+        dist2[j] = _dist_to_nearest_peak(p, int(np.clip(y2[j], 0, H - 1)))
+
+    # convert distances -> [0,1] adherence scores (1 if on-peak, decays with distance)
+    peak_tol = max(int(peak_tol), 0)
+    if peak_tol == 0:
+        on1 = (dist1 == 0).astype(np.float32)
+        on2 = (dist2 == 0).astype(np.float32)
+    else:
+        # smooth decay; dist==0 -> 1, dist==peak_tol -> ~0.37, dist>> -> ~0
+        # on1 = np.exp(-(dist1 / float(peak_tol))**2).astype(np.float32)
+        # on2 = np.exp(-(dist2 / float(peak_tol))**2).astype(np.float32)
+
+        # Trying a slower decay to permit higher scores, and really penalize those that are way off
+        d1 = np.maximum(dist1 - peak_tol, 0).astype(np.float32)
+        d2 = np.maximum(dist2 - peak_tol, 0).astype(np.float32)
+
+        # decay scale in pixels beyond tolerance (separate from peak_tol)
+        tau = float(peak_tol)  # or set tau=1.5, etc.
+        on1 = np.exp(-d1 / tau)
+        on2 = np.exp(-d2 / tau)
+
+    peak_score = on1 * on2  # both need to land on peaks
+
+    # --- 2) gap behavior (pinning + local variance) ---
+    d = (y2.astype(np.float32) - y1.astype(np.float32))  # (W,)
+
+    # (a) penalize being pinned at the hard floor dmin (or near it)
+    gap_margin = float(max(gap_margin, 1e-6))
+    floor_score = np.clip((d - float(dmin)) / gap_margin, 0.0, 1.0).astype(np.float32)
+
+    # optionally penalize being pinned at dmax too
+    if dmax is not None:
+        ceil_score = np.clip((float(dmax) - d) / gap_margin, 0.0, 1.0).astype(np.float32)
+        pin_score = floor_score * ceil_score
+    else:
+        pin_score = floor_score
+
+    # (b) running std of the gap -> "local parallelness"
+    win = int(var_win)
+    if win < 3:
+        gap_std = np.zeros(W, dtype=np.float32)
+    else:
+        if win % 2 == 0:
+            win += 1
+        pad = win // 2
+        k = np.ones(win, dtype=np.float32) / win
+
+        dp = np.pad(d, (pad, pad), mode="edge")
+        m1 = np.convolve(dp, k, mode="valid")
+        m2 = np.convolve(dp * dp, k, mode="valid")
+        var = np.maximum(0.0, m2 - m1 * m1)
+        gap_std = np.sqrt(var).astype(np.float32)
+
+    var_tau = float(max(var_tau, 1e-6))
+    parallel_score = np.exp(-gap_std / var_tau).astype(np.float32)  # 1 when std~0, decays smoothly
+
+    # --- 3) intensity score (quite simple)
+    intensity1 = peak_source_img[y1,np.arange(peak_source_img.shape[1])]
+    intensity2 = peak_source_img[y2,np.arange(peak_source_img.shape[1])]
+    intensity_score = intensity1*intensity2
+    # --- combine ---
+    gof = peak_score * pin_score * parallel_score
+    gof = np.clip(gof, 0.0, 1.0).astype(np.float32)
+
+    if return_parts:
+        parts = dict(
+            peak_score=peak_score.astype(np.float32),
+            pin_score=pin_score.astype(np.float32),
+            parallel_score=parallel_score.astype(np.float32),
+            gap=d.astype(np.float32),
+            gap_std=gap_std.astype(np.float32),
+            dist1=dist1,
+            dist2=dist2,
+            intensity1=intensity1,
+            intensity2=intensity2,
+            intensity_score=intensity_score,
+        )
+        return gof, parts
+
+    return gof
+
+
+import numpy as np
+from scipy.ndimage import uniform_filter1d, median_filter, minimum_filter1d, maximum_filter1d
+class GOFProcessing:
+    @staticmethod
+    def _smooth(x, kind="median", width=25):
+        x = np.asarray(x, dtype=np.float32)
+        w = int(width)
+        if w <= 1:
+            return x
+        if kind == "median":
+            return median_filter(x, size=w, mode="nearest")
+        if kind == "mean":
+            return uniform_filter1d(x, size=w, mode="nearest")
+        raise ValueError("kind must be 'median' or 'mean'")
+
+    @staticmethod
+    def _runs_keep_min_len(mask, min_len):
+        """mask: (W,) bool -> keeps only True-runs of length >= min_len."""
+        mask = np.asarray(mask, dtype=bool)
+        if min_len <= 1:
+            return mask
+        d = np.diff(np.r_[False, mask, False].astype(np.int8))
+        starts = np.flatnonzero(d == 1)
+        ends   = np.flatnonzero(d == -1)
+        out = np.zeros_like(mask)
+        for s, e in zip(starts, ends):
+            if (e - s) >= min_len:
+                out[s:e] = True
+        return out
+
+    @staticmethod
+    def window_quantile(x, q=0.05, width=51):
+        """
+        Robust sliding quantile approximation using min/max filters.
+        For small q (like 0.05), minimum_filter1d is a decent conservative proxy.
+        If you need exact quantiles, do a rolling window via stride tricks (heavier).
+        """
+        x = np.asarray(x, dtype=np.float32)
+        w = int(width)
+        if w <= 1:
+            return x
+        # conservative: q<=0.1 -> use min filter; q>=0.9 -> use max filter
+        if q <= 0.1:
+            return minimum_filter1d(x, size=w, mode="nearest")
+        if q >= 0.9:
+            return maximum_filter1d(x, size=w, mode="nearest")
+        # mid-quantiles: fall back to mean of min/max envelopes (cheap heuristic)
+        lo = minimum_filter1d(x, size=w, mode="nearest")
+        hi = maximum_filter1d(x, size=w, mode="nearest")
+        return lo + (hi - lo) * q
+
+    @staticmethod
+    def keep_confluent_regions(metric, threshold, percentile=0.05, required_width=80, window_width=None):
+        """
+        Keep indices where the windowed low-quantile of metric is above threshold,
+        then keep only runs of length >= required_width.
+        """
+        metric = np.asarray(metric, dtype=np.float32)
+        W = metric.shape[0]
+        if window_width is None:
+            window_width = required_width
+
+        qv = GOFProcessing.window_quantile(metric, q=percentile, width=window_width)  # (W,)
+        mask = qv >= float(threshold)
+        return GOFProcessing._runs_keep_min_len(mask, int(required_width))
+
+    @staticmethod
+    def zero_narrow(metric, zeroing_metric, low_threshold=0.1, low_percentile=0.05, guard_width=51, factor=0.0):
+        """
+        Suppress regions near very low values in `zeroing_metric`.
+        - Compute a low-quantile proxy of zeroing_metric (windowed minimum for q<=0.1)
+        - Mark low-support areas
+        - Dilate that mask to carve a guard band
+        - Apply factor inside guard band
+        """
+        metric = np.asarray(metric, dtype=np.float32).copy()
+        z = np.asarray(zeroing_metric, dtype=np.float32)
+
+        z_low = GOFProcessing.window_quantile(z, q=low_percentile, width=guard_width)
+        low = z_low <= float(low_threshold)
+
+        # expand low regions by guard_width/2 to kill nearby inclusions
+        low_dil = maximum_filter1d(low.astype(np.float32), size=guard_width, mode="nearest") > 0
+
+        metric[low_dil] *= float(factor)
+        return metric
+
+    @staticmethod
+    def EZ_inclusion_selection(
+        parts,
+        *,
+        required_width=80,
+        threshold=0.25,
+        percentile=0.05,
+        smooth_kind="median",
+        smooth_width=51,
+        guard_width=51,
+        low_threshold=0.1,
+        low_percentile=0.05,
+    ):
+        # 1) composite score (smoothed product)
+        peak = GOFProcessing._smooth(parts["peak_score"], kind=smooth_kind, width=smooth_width)
+        inten = GOFProcessing._smooth(parts["intensity_score"], kind=smooth_kind, width=smooth_width)
+        peak_inten = peak * inten
+
+        # 2) carve out areas near low intensity1 (choroid grabs / junk)
+        peak_inten_narrowed = GOFProcessing.zero_narrow(
+            peak_inten,
+            parts["intensity1"],
+            low_threshold=low_threshold,
+            low_percentile=low_percentile,
+            guard_width=guard_width,
+            factor=0.0,
+        )
+
+        # 3) require confluent regions
+        mask = GOFProcessing.keep_confluent_regions(
+            peak_inten_narrowed,
+            threshold=threshold,
+            percentile=percentile,
+            required_width=required_width,
+            window_width=required_width,
+        )
+
+        return peak_inten,peak_inten_narrowed,mask

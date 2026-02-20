@@ -18,6 +18,10 @@ def load_constants():
 C = load_constants()
 
 
+
+def strip_sn4(s):
+    return re.sub(r"sn\d{4}_","",s)
+
 def load_ss_volume(fp):
     """loads a direct file from numpy if possible too now. Defaults to the shape of 1024 slices, 1536 tall, 512 wide
     """
@@ -124,7 +128,7 @@ def curves_to_label_vol( # MAY NEED REWRITING.
     k = int(vert_dilation_size)
     offsets = np.arange(-k, k + 1, dtype=np.int32)      # (2k+1,)
 
-    li = 1
+    label_idx = 1
     for li, (key,curve) in enumerate(layers.items(), start=1):
         # sanitize Y centers
         if key not in names_to_use:
@@ -150,8 +154,8 @@ def curves_to_label_vol( # MAY NEED REWRITING.
             # write only into background (keep_existing semantics)
             empty = (lbl_flat[idx] == 0)
             if empty.any():
-                lbl_flat[idx[empty]] = li 
-        li += 1
+                lbl_flat[idx[empty]] = label_idx 
+        label_idx += 1
 
     return lbl
 
@@ -443,6 +447,7 @@ def guess_and_plot_brute(
         plt.show()
 
     return {"2d": candidates_2d, "3d": candidates_3d}
+
 
 
 

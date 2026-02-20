@@ -23,6 +23,7 @@ def extract_lite(ilm_ctx, rpe_ctx):
     hp = rpe_ctx.hypersmoother_params
 
     hr = getattr(rpe_ctx, "highres_ctx", None)
+    tl = getattr(rpe_ctx, "two_layer_dp_ctx", None)
 
     d = {
         # ---- final-ish lines you want stackable ----
@@ -34,6 +35,10 @@ def extract_lite(ilm_ctx, rpe_ctx):
         # ---- optional refined lines ----
         "rpe_refined1": hr.rpe_refined,
         "rpe_refined2": hr.rpe_refined2,
+        'rpe_smooth2': hr.rpe_smooth2,
+
+        'y1_rescaled': tl.y1_rescaled,
+        'y2_rescaled': tl.y2_rescaled,
 
         # ---- light params ----
         # keep shift if you want resume/unsmooth later
@@ -151,6 +156,9 @@ def process_volume_lite(vol_fp, *, z_step=1, max_workers=8, rpe_steps=None, out_
         "ilm_smooth",
         "rpe_refined1",
         "rpe_refined2",
+        "rpe_smooth2",
+        'y1_rescaled',
+        'y2_rescaled',
         # add "rpe_smooth2" if you create it later
     ]
     stacked = collate_stackable(slice_dicts, STACK_KEYS)
@@ -195,7 +203,8 @@ if __name__ == "__main__":
     parser.add_argument("--outputs_root", type=str)
     args = parser.parse_args()
 
-    STEPS = sp.RPE_STEPS_1_25_26  # swap to your desired list
+    # STEPS = sp.RPE_STEPS_1_25_26  # swap to your desired list
+    STEPS = sp.RPE_STEPS_2_12_26  # swap to your desired list
 
     batch_process_dir_lite(
         args.volumes_root,
@@ -207,6 +216,24 @@ if __name__ == "__main__":
     )
 
 
+
+"""
+--vol_dir --z_stride 25 --labels_dir_suffix _layers_2026_01_31 --cube_numbers 2,3,14
+
+example run
+
+python code_files/setup_data/02_segment_ILM_RPE.py --volumes_root "/Volumes/msh_uiowa/Research Data/Han_AIR_Dec_2025/data_volumes/data_all_volumes/" --pattern "*.img" --z_step 500 --max_workers 8 --outputs_root /Users/matthewhunt/Research/Iowa_Research/Han_AIR/data_volumes/data_all_volumes_layers_2026_02_12
+
+
+
+"""
+
+# python code_files/setup_data/02_segment_ILM_RPE.py \
+    # --volumes_root "/Volumes/msh_uiowa/Research Data/Han_AIR_Dec_2025/data_volumes/data_all_volumes/" \
+    # --pattern "*.img" \
+    # --z_step 500 \
+    # --max_workers 8 \
+    # --outputs_root /Users/matthewhunt/Research/Iowa_Research/Han_AIR/data_volumes/data_all_volumes_layers_2026_02_12
 
 
 
