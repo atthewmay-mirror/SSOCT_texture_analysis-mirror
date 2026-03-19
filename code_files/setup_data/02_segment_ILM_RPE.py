@@ -208,6 +208,7 @@ if __name__ == "__main__":
     parser.add_argument("--outputs_root", type=str)
     parser.add_argument("--annotation_root", type=str)
     parser.add_argument("--cube_numbers", type=str, default=None)
+    parser.add_argument("--input_file", type=str, default=None,help="Takes a single filename (not full path), and segments just that one")
     args = parser.parse_args()
 
     # STEPS = sp.RPE_STEPS_1_25_26  # swap to your desired list

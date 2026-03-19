@@ -35,6 +35,278 @@ def _column_best_and_second_best_gap(cost_col: np.ndarray, guard: int = 3):
 
 import numpy as np
 
+
+def run_two_surface_DP_3_9_26(
+    cost1: np.ndarray,              # (H,W) boundary cost for upper surface (lower is better)
+    cost2: np.ndarray,              # (H,W) boundary cost for lower surface
+    dmin: int,
+    dmax: int,
+    max_step1: int,
+    max_step2: int,
+    lambda1: float,
+    lambda2: float,
+    # --- NEW: encourage lower surface to "claim" the single ridge (via NMS peaks)
+    prefer_lower_on_single: bool = True,
+    prefer_upper_on_single: bool = False,   # <-- NEW
+    single_kappa: float = 0.0,          # strength of anchoring penalty (0 disables)
+    kappa_mode: str = 'abs_dist',          # strength of anchoring penalty (0 disables)
+    # NMS params (expects "evidence" where higher=better)
+    peak_sigma: float=1,
+    peak_distance: float = 5,
+    peak_prominance: float = 0.05, # again if sweep later, refactor into config
+    # optional extras (usually leave 0 initially)
+    sep_gamma: float = 0.0,             # softly prefer (y2-y1) near dmin
+    depth_a1: float = 0.0,              # add depth_a1 * r to cost1 (r in [0,1])
+    depth_a2: float = 0.0,              # add depth_a2 * r to cost2
+    
+
+    # barrier_cost_params: dict = {'alpha':6.0}, # woud modify if using the other
+    # barrier_cost_function = barrier_from_cost_exp,
+    darkness_barrier: np.ndarray = None, # We will directly take these from a different pre-prepped fn
+    darkness_Bcs: np.ndarray = None,
+    darkness_barrier_factor: float = 0.0,
+
+    # --- NEW: ONH handling ---
+    ONH_region=None,
+    onh_cost: float = 0.5,               # boundary cost in ONH columns
+    # onh_disable_kappa: bool = True,      # ignore anchoring in ONH columns
+    # onh_disable_barrier: bool = True,    # ignore darkness barrier in ONH columns
+    # onh_exclude_from_norm: bool = True,  # exclude ONH columns from mn/mx for c2n
+
+    # debug
+    return_debug: bool = False,
+):
+    """
+    update: allow flexibility with top vs bottom line preference (for choroidal vs Ez cases)
+
+    Parallel 2-surface DP with hard separation + first-order smoothness.
+    Adds an optional NMS-based "single ridge" detector that anchors y2 to the
+    strongest peak in cost2-evidence when only one peak is present.
+
+    Anchor penalty (only for columns classified as single-peak):
+      extra = kappa[j] * |y2[j] - anchor2[j]|
+    where kappa[j] is either single_kappa (single-peak) or 0 (multi-peak).
+
+    Returns:
+      y1, y2 (W,)
+      if return_debug: (y1, y2, debug_dict)
+    """
+
+    if prefer_lower_on_single and prefer_upper_on_single:
+        raise ValueError("Set only one of prefer_lower_on_single / prefer_upper_on_single.")
+
+    # --------- basic checks ----------
+    if cost1.shape != cost2.shape:
+        raise ValueError(f"cost1 and cost2 must match. Got {cost1.shape} vs {cost2.shape}")
+    if cost1.ndim != 2:
+        raise ValueError("cost1/cost2 must be 2D (H,W).")
+    if dmin < 0 or dmax < dmin:
+        raise ValueError("Require 0 <= dmin <= dmax.")
+
+    H, W = cost1.shape
+
+    onh_cols = suf._onh_cols_from_region(ONH_region, W)
+
+    cost1 = np.asarray(cost1, dtype=float)
+    cost2 = np.asarray(cost2, dtype=float)
+    cost1 = np.nan_to_num(cost1, nan=np.inf, posinf=np.inf, neginf=np.inf)
+    cost2 = np.nan_to_num(cost2, nan=np.inf, posinf=np.inf, neginf=np.inf)
+
+    # barrier = cost2 # shape (H,W), values in [0,1] ideally
+
+    # --------- optional depth priors (small) ----------
+    if depth_a1 != 0.0 or depth_a2 != 0.0:
+        r = (np.arange(H, dtype=float) / max(H - 1, 1))[:, None]  # (H,1)
+        if depth_a1 != 0.0:
+            cost1 = cost1 + depth_a1 * r
+        if depth_a2 != 0.0:
+            cost2 = cost2 + depth_a2 * r
+
+    # --------- NMS-based anchor2 + kappa[j] ----------
+    anchor = np.zeros(W, dtype=np.int32)
+    kappa = np.zeros(W, dtype=float)
+    # nms_maxima2 = None
+
+    # -------------make inverse of cost two -----------
+    # c2c = cost2.copy()
+    # finite = np.isfinite(c2c)
+    # mn = float(np.min(c2c[finite])); mx = float(np.max(c2c[finite]))
+    # c2n = (c2c - mn) / (mx - mn + 1e-8)     # 0=best, 1=worst
+    # evidence2 = 1.0 - c2n        
+    # Bcs = np.cumsum(evidence2, axis=0)          # (H,W)
+    # # evidence2 = None
+
+
+    # -------------new cost barrier fn --------
+    c2 = cost2.copy()
+    finite = np.isfinite(c2)
+    mn = float(np.min(c2[finite])); mx = float(np.max(c2[finite]))
+    c2n = (c2 - mn) / (mx - mn + 1e-8)   # 0=best ridge, 1=worst background
+    evidence2 = 1.0 - c2n
+
+    if darkness_barrier_factor != 0.0:
+        darkness_barrier = darkness_barrier         # option 1
+        darkness_Bcs = darkness_Bcs
+
+    if onh_cols is not None:
+        if darkness_Bcs is not None:
+            darkness_Bcs[:,onh_cols]=0
+        cost1[:,onh_cols]=onh_cost
+        cost2[:,onh_cols]=onh_cost
+    # print("we are attempting to do the quickfig")
+    # spu.quickfig(cost1)
+
+    peaks=None
+    if (prefer_lower_on_single or prefer_upper_on_single) and single_kappa > 0.0:
+        # do realize this is finging peaks based on c2, not c1, so if asymmetric will need to check
+        peaks = suf.peakSuppressor.EZ_RPE_peak_suppression_pipeline(1-c2n,1-c2n,ilm_line=None,
+                                                                    **{'sigma':peak_sigma,
+                                                                        'peak_distance':peak_distance,
+                                                                        'peak_prominance':peak_prominance}) # again if sweep later, refactor into config
+
+        # classify each column as single-peak vs multi-peak (cluster flat-tops)
+        for j in range(W): # the whole anchor is confusing bc it looks like we pick strongest peak, but the anchor is only applied if there is just one peak!
+            rows = peaks[j]
+            kappa[j] = float(single_kappa) if len(rows) == 1 else 0.0 # 
+
+    if onh_cols is not None:
+        kappa[onh_cols] = 0.0
+    # --------- DP tables ----------
+    C_prev = np.full((H, H), np.inf, dtype=float)
+    C_cur  = np.full((H, H), np.inf, dtype=float)
+    P1 = np.full((H, H, W), -1, dtype=np.int32)
+    P2 = np.full((H, H, W), -1, dtype=np.int32)
+
+    # --------- init column 0 ----------
+    j = 0
+    for i1 in range(H):
+        i2_lo = i1 + dmin
+        i2_hi = min(H - 1, i1 + dmax)
+        if i2_lo >= H:
+            continue
+
+        c1 = cost1[i1, j]
+        if prefer_upper_on_single:
+            c1 = c1 * (1 + kappa[j])
+
+        for i2 in range(i2_lo, i2_hi + 1):
+            c2 = cost2[i2, j]
+            if prefer_lower_on_single:
+                c2 = c2 * (1 + kappa[j])
+
+            extra = 0.0
+            if sep_gamma != 0.0:
+                extra += sep_gamma * abs((i2 - i1) - dmin)
+
+            C_prev[i1, i2] = c1 + c2 + extra
+
+    if not np.isfinite(C_prev).any():
+        raise RuntimeError("No feasible initial states at column 0 (check dmin/dmax and inf costs).")
+
+    # --------- forward DP ----------
+    for j in range(1, W):
+        C_cur.fill(np.inf)
+
+        for i1 in range(H):
+            i2_lo = i1 + dmin
+            i2_hi = min(H - 1, i1 + dmax)
+            if i2_lo >= H:
+                continue
+
+            c1 = cost1[i1, j]
+            if prefer_upper_on_single:
+                c1 *= 1+kappa[j]
+
+            k1_lo = max(0, i1 - max_step1)
+            k1_hi = min(H - 1, i1 + max_step1)
+
+            for i2 in range(i2_lo, i2_hi + 1):
+                c2 = cost2[i2, j]
+                if prefer_lower_on_single:
+                    c2 *= 1+kappa[j]
+                # per-column extras (anchor + optional sep preference)
+                extra = 0.0
+                if sep_gamma != 0.0:
+                    extra += sep_gamma * abs((i2 - i1) - dmin)
+
+                k2_lo = max(0, i2 - max_step2)
+                k2_hi = min(H - 1, i2 + max_step2)
+
+                best_val = np.inf
+                best_k1 = -1
+                best_k2 = -1
+
+                for k1 in range(k1_lo, k1_hi + 1):
+                    step1 = lambda1 * abs(i1 - k1)
+
+                    kk2_lo = max(k2_lo, k1 + dmin)
+                    kk2_hi = min(k2_hi, k1 + dmax)
+                    if kk2_lo > kk2_hi:
+                        continue
+
+                    for k2 in range(kk2_lo, kk2_hi + 1):
+                        prev_cost = C_prev[k1, k2]
+                        if not np.isfinite(prev_cost):
+                            continue
+                        if darkness_barrier_factor != 0:
+                            dy = abs(i2 - k2)
+                            step2 = lambda2 * dy + darkness_barrier_factor * barrier_sum(darkness_Bcs,j, k2, i2)
+                        else:
+                            step2 = lambda2 * abs(i2 - k2)
+                        val = prev_cost + step1 + step2
+
+                        if val < best_val:
+                            best_val = val
+                            best_k1 = k1
+                            best_k2 = k2
+
+                if best_k1 >= 0:
+                    C_cur[i1, i2] = c1 + c2 + extra + best_val
+                    P1[i1, i2, j] = best_k1
+                    P2[i1, i2, j] = best_k2
+
+        if not np.isfinite(C_cur).any():
+            raise RuntimeError(f"DP infeasible at column {j} (all inf). Check costs/constraints.")
+        C_prev, C_cur = C_cur, C_prev
+
+    # --------- choose best end state ----------
+    finite_mask = np.isfinite(C_prev)
+    if not finite_mask.any():
+        raise RuntimeError("No feasible ending state (all inf).")
+    end_flat = int(np.argmin(np.where(finite_mask, C_prev, np.inf)))
+    end_i1, end_i2 = np.unravel_index(end_flat, C_prev.shape)
+
+    # --------- backtrack ----------
+    y1 = np.zeros(W, dtype=np.int32)
+    y2 = np.zeros(W, dtype=np.int32)
+    y1[-1] = int(end_i1)
+    y2[-1] = int(end_i2)
+
+    for j in range(W - 1, 0, -1):
+        k1 = int(P1[y1[j], y2[j], j])
+        k2 = int(P2[y1[j], y2[j], j])
+        if k1 < 0 or k2 < 0:
+            raise RuntimeError(f"Backtrack failed at column {j}.")
+        y1[j - 1] = k1
+        y2[j - 1] = k2
+
+    if not return_debug:
+        return y1.astype(int), y2.astype(int)
+
+    debug = {
+        "anchor2": anchor.astype(int),
+        "kappa": kappa.astype(float),
+        "final_cost": float(C_prev[end_i1, end_i2]),
+    }
+    if peaks is not None:
+        # print("peaks is not none, should be adding to the debug outptu")
+        debug["peaks"] = peaks
+    if darkness_barrier is not None:
+        debug["darkness_barrier"] = darkness_barrier
+        # debug["evidence2"] = evidence2
+    return y1.astype(int), y2.astype(int), debug
+
+
 def run_two_surface_DP(
     cost1: np.ndarray,              # (H,W) boundary cost for upper surface (lower is better)
     cost2: np.ndarray,              # (H,W) boundary cost for lower surface
@@ -46,6 +318,7 @@ def run_two_surface_DP(
     lambda2: float,
     # --- NEW: encourage lower surface to "claim" the single ridge (via NMS peaks)
     prefer_lower_on_single: bool = True,
+    prefer_upper_on_single: bool = False,   # <-- NEW
     single_kappa: float = 0.0,          # strength of anchoring penalty (0 disables)
     kappa_mode: str = 'abs_dist',          # strength of anchoring penalty (0 disables)
     # NMS params (expects "evidence" where higher=better)
@@ -85,6 +358,10 @@ def run_two_surface_DP(
       y1, y2 (W,)
       if return_debug: (y1, y2, debug_dict)
     """
+
+    if prefer_lower_on_single and prefer_upper_on_single:
+        raise ValueError("Set only one of prefer_lower_on_single / prefer_upper_on_single.")
+
     # --------- basic checks ----------
     if cost1.shape != cost2.shape:
         raise ValueError(f"cost1 and cost2 must match. Got {cost1.shape} vs {cost2.shape}")
@@ -497,7 +774,7 @@ def add_dp_sweep_to_arrayboard(
     # AB.add(img_full, lines=lines_full, title=fill(f"{title_prefix} full overlays",width=30))
 
     # --- 1D plots per result (compact but useful)
-    from scipy.ndimage import median_filter,uniform_filter1d
+    from scipy.ndimage import median_filter
     import matplotlib.pyplot as plt
     def _plot_dict(ax, plot_dict, legend=True):
         cycle_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']

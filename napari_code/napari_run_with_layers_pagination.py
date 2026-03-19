@@ -79,6 +79,25 @@ def parse_args():
         default="_layers",
         help="Glob pattern inside --vol_dir to find volumes (default: *.npy)."
     )
+    
+    p.add_argument(
+        "--layers_root",
+        type=str,
+        help="supply entire dir"
+    )
+
+    p.add_argument(
+        "--annotation_root",
+        type=str,
+        default=None,
+    )
+
+    p.add_argument(
+        "--use_skip_yaml",
+        action="store_true",
+    )
+
+
 
 
 
@@ -158,15 +177,17 @@ def ensure_image_zarr(vol_path: Path, z_stride: int,overwrite: bool) -> Path:
         print(f"[reuse] image → {zarr_path}")
     return zarr_path
 
-def ensure_labels_zarr(vol_path: Path, z_stride: int,overwrite: bool,dir_suffix: str ) -> Path:
+def ensure_labels_zarr(vol_path: Path, z_stride: int,overwrite: bool,layers_root: str ) -> Path:
     """Create/reuse a labels Zarr from the *_layers.npz file aligned to vol_path.
     if supplied a labels_dir
     1/26/26: now accepting a zarr folder with subfoldersing during the refactorj
     """
     # layer_path = fu.get_corresponding_layer_path(vol_path, file_suffix='_layers.npz', dir_suffix=dir_suffix)
     # layer_path = fu.get_corresponding_layer_path(vol_path, file_suffix='', dir_suffix=dir_suffix) # For january script, just keep name for simplicity
-    layer_path = fu.new_get_corresponding_layer_path(vol_path,dir_suffix=dir_suffix) # For january script, just keep name for simplicity
+    layer_path = fu.new_get_corresponding_layer_path(vol_path,layers_root=layers_root) # For january script, just keep name for simplicity
     if not layer_path.exists():
+        print(f"Layer file not found for {vol_path}. For now will simply return")
+        return None
         raise FileNotFoundError(f"Layer file not found for {vol_path}: {layer_path}")
     labels_zarr = layer_path.with_suffix(".zarr") # now a dir with group
 
@@ -196,7 +217,7 @@ def ensure_labels_zarr(vol_path: Path, z_stride: int,overwrite: bool,dir_suffix:
             # "ilm_rpe_refined": ["ilm_smooth", "rpe_refined1", "rpe_refined2"],
             "ilm_rpe_refined": ["ilm_smooth", "rpe_smooth2"],
             "rpe_family":      ["rpe_raw", "rpe_smooth", "hypersmoother_path"],
-            "two_layer_family":      ["y1_rescaled", "y2_rescaled"],
+            "two_layer_family":      ["y1_rescaled", "y2_rescaled","rpe_smooth2"],
         }
  
         vols = {}
@@ -309,6 +330,38 @@ def ensure_labels_flat_zarr(vol_path: Path, flatten_with: str, z_stride: int, ov
     return labels_flat_zarr
 
 
+### ==================Slice-Labelling Utils==========
+# ---- QUICK GRAB HOTKEYS (writes YAML immediately; safe/atomic) ----
+    
+GRAB_YAML_PATH = Path("/Users/matthewhunt/Research/Iowa_Research/Han_AIR/data/example_slice_yamls/choroidal_EZ_good_slices.yaml")
+# GRAB_YAML_PATH.parent.mkdir(parents=True, exist_ok=True)
+print(f"[quick-grab] YAML will be written to: {GRAB_YAML_PATH}")
+
+def _atomic_write_yaml(data: dict, path: Path):
+    import yaml
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        yaml.safe_dump(data, f, sort_keys=False)
+    tmp.replace(path)  # atomic on same filesystem
+
+def _load_grabs(path: Path) -> dict:
+    import yaml
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r") as f:
+            d = yaml.safe_load(f) or {}
+        return d if isinstance(d, dict) else {}
+    except Exception as e:
+        print(f"[quick-grab] WARNING: failed to read {path}: {e}")
+        return {}
+
+def _current_z_index(viewer: napari.Viewer, img_ndim: int) -> int:
+    # img.ndim == 3: (Z,Y,X) -> z axis is 0
+    # img.ndim == 4: (C,Z,Y,X) -> z axis is 1
+    z_axis = 0 if img_ndim == 3 else 1
+    return int(viewer.dims.current_step[z_axis])
+
 import time
 from dask import array as da
 def from_zarr_fresh(path: str):
@@ -317,7 +370,8 @@ def from_zarr_fresh(path: str):
     mtime = Path(path).stat().st_mtime_ns
     return da.from_zarr(za, name=f"from_zarr-{mtime}-{time.time_ns()}")
 
-def load_one_volume(vp: Path, z_stride: int, overwrite: bool, flatten_with: str | None,dir_suffix:str = '_layers'):
+# def load_one_volume(vp: Path, z_stride: int, overwrite: bool, flatten_with: str | None,dir_suffix:str = '_layers',annotation_root=None):
+def load_one_volume(vp: Path, z_stride: int, overwrite: bool, flatten_with: str | None,layers_root:str = None,annotation_root=None):
     """
     Return (img, lbl, name) for a single volume:
       - If flatten_with is None: img.shape = (Z, Y, X)
@@ -329,12 +383,12 @@ def load_one_volume(vp: Path, z_stride: int, overwrite: bool, flatten_with: str 
     # ensure raw caches
     img_z = ensure_image_zarr(vp, 1, overwrite) # Shoudl refactor to remove the zstride. 
     # lbl_z = ensure_labels_zarr(vp, z_stride, OVERWRITE_LABELS,dir_suffix=dir_suffix) # force this to ahve a zstride of one I think?
-    lbl_z = ensure_labels_zarr(vp, 1, overwrite,dir_suffix=dir_suffix) # force this to ahve a zstride of one I think?
     img_raw = da.from_zarr(str(img_z))     # (Z,Y,X)
     img_raw = img_raw[::z_stride]
     # lbl_raw = da.from_zarr(str(lbl_z))
 
     # labels are a zarr group: {set_name: (Z,Y,X)}
+    lbl_z = ensure_labels_zarr(vp, 1, overwrite,layers_root=layers_root) # force this to ahve a zstride of one I think?
     g = zarr.open_group(str(lbl_z), mode="r")
     lbl_raw = {name: da.from_zarr(g[name]) for name in g.array_keys()}
 
@@ -346,8 +400,13 @@ def load_one_volume(vp: Path, z_stride: int, overwrite: bool, flatten_with: str 
     
 
 
-    annotation_path = Path('/Users/matthewhunt/Research/Iowa_Research/Han_AIR/annotations_dir/testing_annotations') / vp.with_suffix('.labels.zarr').name 
-    annotation_path = Path(C['annotation_root']) / vp.with_suffix('.labels.zarr').name 
+    # annotation_path = Path('/Users/matthewhunt/Research/Iowa_Research/Han_AIR/annotations_dir/testing_annotations') / vp.with_suffix('.labels.zarr').name 
+    if annotation_root is None:
+        annotation_root = Path(C['annotation_root'])
+    else:
+        annotation_root = Path(annotation_root)
+
+    annotation_path =  annotation_root / vp.with_suffix('.labels.zarr').name 
     annotation_img = None
     if annotation_path.exists():
         annotation_img = ensure_image_zarr(annotation_path, 1, overwrite=False) # overwrite hard-set to false bc you don't ever re-compute the annotations here! 
@@ -356,7 +415,7 @@ def load_one_volume(vp: Path, z_stride: int, overwrite: bool, flatten_with: str 
         annotation_img = from_zarr_fresh(str(annotation_img))
         # print("annotation unique:", np.unique(annotation_img[:1].compute()))
         annotation_img = annotation_img[::z_stride]
-        print("annotation unique:", np.unique(annotation_img[:].compute()))
+        # print("annotation unique:", np.unique(annotation_img[:].compute()))
 
 
     if not flatten_with:
@@ -407,39 +466,44 @@ def main():
         print("will by default overwrite_labels bc overwrithe_files=True")
         OVERWRITE_LABELS = True
 
-    if args.glob:
-        ALL_VOL_PATHS = sorted(Path(args.vol_dir).glob(args.glob))
-    elif args.cube_numbers:
-        print("trying the cube numbers")
-        import re
+    # if args.glob:
+    #     ALL_VOL_PATHS = sorted(Path(args.vol_dir).glob(args.glob))
 
-        want = [int(x) for x in args.cube_numbers.split(",")]
-        CUBE_RE = re.compile(r"^(\d+)_Cube ")
-        vol_dir = Path(args.vol_dir)
-        # want = set(args.cube_numbers)
+    #     if args.use_skip_yaml:
+           
 
-        # output_files = []
-        # for p in vol_dir.iterdir():
-        #     if not p.is_file():
-        #         continue
-        #     print(p.name)
-        #     m = CUBE_RE.match(p.name)
-        #     print(m)
-        #     if int(m.group(1)) in want:
-        #         print('found the int')
-        ALL_VOL_PATHS = sorted(
-            p for p in vol_dir.iterdir()
-            if p.is_file()
-            and (m := CUBE_RE.match(p.name))
-            and int(m.group(1)) in want
-        )
+    # elif args.cube_numbers:
+    #     print("trying the cube numbers")
+    #     import re
 
-        # files = os.listdir(args.vol_dir)
-        # ALL_VOL_PATHS = [f for f in files if any([f"{n}_Cube_" in f for n in args.cube_numbers])]
-    else:
-        print('neither arg glob or numbers supplied')
-    if not ALL_VOL_PATHS:
-        raise FileNotFoundError(f"No volumes in {args.vol_dir} matching {args.glob}")
+    #     want = [int(x) for x in args.cube_numbers.split(",")]
+    #     CUBE_RE = re.compile(r"^(\d+)_Cube ")
+    #     vol_dir = Path(args.vol_dir)
+    #     # want = set(args.cube_numbers)
+
+    #     # output_files = []
+    #     # for p in vol_dir.iterdir():
+    #     #     if not p.is_file():
+    #     #         continue
+    #     #     print(p.name)
+    #     #     m = CUBE_RE.match(p.name)
+    #     #     print(m)
+    #     #     if int(m.group(1)) in want:
+    #     #         print('found the int')
+    #     ALL_VOL_PATHS = sorted(
+    #         p for p in vol_dir.iterdir()
+    #         if p.is_file()
+    #         and (m := CUBE_RE.match(p.name))
+    #         and int(m.group(1)) in want
+    #     )
+
+    #     # files = os.listdir(args.vol_dir)
+    #     # ALL_VOL_PATHS = [f for f in files if any([f"{n}_Cube_" in f for n in args.cube_numbers])]
+    # else:
+    #     print('neither arg glob or numbers supplied')
+    # if not ALL_VOL_PATHS:
+    #     raise FileNotFoundError(f"No volumes in {args.vol_dir} matching {args.glob}")
+    ALL_VOL_PATHS = fu.get_all_vol_paths(args.vol_dir,glob=args.glob,cube_numbers=args.cube_numbers,use_skip_yaml=args.use_skip_yaml)
 
     print(f"[pager] Found {len(ALL_VOL_PATHS)} volumes")
 
@@ -459,6 +523,30 @@ def main():
     state = {"idx": 0, "img_layer": None, "lbl_layers": {}, "annotation_layer": None, "name": None}
 
 
+    def _append_grab(category: str):
+        # category in {"choroidal_grab","EZ_grab","good_seg"}
+        # z_step_size: use args.z_stride (your thinning step)
+        z_step_size = int(getattr(args, "z_stride", 1))
+        vol_id = str(state.get("name", "UNKNOWN_VOLUME"))
+
+        # Determine current z from the currently loaded volume layer
+        img_layer = state.get("img_layer", None)
+        if img_layer is None:
+            print("[quick-grab] No image layer yet; nothing saved.")
+            return
+        img_ndim = img_layer.data.ndim
+        slice_idx = _current_z_index(viewer, img_ndim)
+
+        d = _load_grabs(GRAB_YAML_PATH)
+        d.setdefault(category, {})
+        d[category].setdefault(vol_id, [])
+        d[category][vol_id].append([slice_idx, z_step_size])
+
+        _atomic_write_yaml(d, GRAB_YAML_PATH)
+        print(f"[quick-grab] + {category} | {vol_id}: [{slice_idx}, {z_step_size}]  ->  {GRAB_YAML_PATH}")
+
+
+
     def _add_current_volume():
         """Load current volume (by state['idx']) and attach to layers (lazy)."""
         from dask import array as da
@@ -467,7 +555,8 @@ def main():
         img, lbl, annotation_img, name = load_one_volume(
             vp, z_stride=args.z_stride, overwrite=args.overwrite_files,
             flatten_with=args.flatten_with,
-            dir_suffix=args.labels_dir_suffix
+            layers_root=args.layers_root,
+            annotation_root=args.annotation_root,
         )
         state["name"] = name
         # print(f"at current index with vp = {vp}, the shapes of are {[e.shape for e in [img, lbl, annotation_img]]}")
@@ -514,8 +603,16 @@ def main():
             state["lbl_layers"] = {}
             for set_name, arr in lbl.items():
                 print(f'set_name = {set_name}, shape = {arr.shape}')
-                lyr = viewer.add_labels(arr, name=set_name, opacity=0.5, scale=scale)
-                lyr.color = {1:'magenta', 2:'yellow', 3:'cyan', 4:'orange', 5:'blue', 6:'green'}
+                # print(f"np.unique(arr.compute()):{np.unique(arr.compute())}")
+                arr = arr.compute()
+                arr = arr.astype(np.int32, copy=False)
+                # color_map = {0:(0,0,0,0),1:'magenta', 2:'yellow', 3:'cyan', 4:'orange', 5:'blue', 6:'green'}
+                lyr = viewer.add_labels(arr, name=set_name, opacity=0.8, scale=scale)
+                # lyr.color_mode = "direct"
+                lyr.color = {0:(0,0,0,0),1:'magenta', 2:'green',6:'yellow', 3:'cyan', 4:'orange', 5:'blue', }
+                lyr.color_mode = "direct"     # key line: don't use auto colormap
+                lyr.refresh()
+                # lyr.color = {1:'magenta', 2:'yellow', 3:'cyan', 4:'orange', 5:'blue', 6:'green'}
                 state["lbl_layers"][set_name] = lyr
 
             if annotation_img is not None:
@@ -652,11 +749,29 @@ def main():
         # state["img_layer"].data = None
         # state["lbl_layer"].data = None
 
+    @viewer.bind_key("Ctrl-H", overwrite=True)
+    def _grab_choroid(v):
+        _append_grab("choroidal_grab")
+
+    @viewer.bind_key("Ctrl-E", overwrite=True)
+    def _grab_ez(v):
+        _append_grab("EZ_grab")
+
+    @viewer.bind_key("Ctrl-G", overwrite=True)
+    def _grab_good(v):
+        _append_grab("good_seg")
+
+    @viewer.bind_key("Ctrl-S", overwrite=True)
+    def _grab_hypersmooth_fail(v):
+        _append_grab("hypersmooth_fail")
+
+
+
     # use Ctrl+]/Ctrl+[ to paginate
     viewer.bind_key('Ctrl-]', _next_volume, overwrite=True)
     viewer.bind_key('Ctrl-[', _prev_volume, overwrite=True)
 
-    add_segmentation_button(viewer)
+    add_segmentation_button(viewer,z_stride=args.z_stride)
     print("now running (pagination: '[' prev, ']' next, 'L' toggle labels)")
     napari.run()
 

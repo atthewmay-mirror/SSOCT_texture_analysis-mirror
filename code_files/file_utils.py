@@ -185,11 +185,16 @@ def get_corresponding_layer_path(vol_path,file_suffix = '.npy', dir_suffix = "_p
 
     return processed_dir / new_filename
 
-def new_get_corresponding_layer_path(vol_path,dir_suffix):
-    """The new jan 2026 way of doing this is nested layer output results under just a different name from teh volume path"""
+def new_get_corresponding_layer_path(vol_path,layers_root = None,dir_suffix=None):
+    """The new jan 2026 way of doing this is nested layer output results under just a different name from teh volume path. Can supply either the dir suffix or the full dir"""
     vol_dir = vol_path.parent
-    layer_output_root = vol_dir.with_name(vol_dir.name.strip("_mini").strip("_full") + dir_suffix)
-    layer_output_dir = layer_output_root / vol_path.stem
+    if dir_suffix:
+        assert layers_root is None
+        layers_root = vol_dir.with_name(vol_dir.name.strip("_mini").strip("_full") + dir_suffix)
+    if type(layers_root)!=Path:
+        layers_root = Path(layers_root)
+
+    layer_output_dir = layers_root / vol_path.stem
     npz_stacked_filename = f"{vol_path.stem}_stacked.npz"
     return layer_output_dir / npz_stacked_filename
 
@@ -467,7 +472,7 @@ def guess_and_plot_brute(
 
 
 #2/2/26
-def load_work_from_yaml(yaml_path,headings,images_root=C['images_root']):
+def load_work_from_yaml(yaml_path,headings,images_root=C['images_root'],max_per_vol=None,file_to_include=None):
     """go from the (image name : slice) pair to the work format of (index, image, onh_info)"""
     import yaml
     cfg = yaml.safe_load(open(yaml_path, "r"))
@@ -478,11 +483,16 @@ def load_work_from_yaml(yaml_path,headings,images_root=C['images_root']):
     work = []
     work_idx = 0
     for filename,slices in items.items():
+        if (file_to_include is not None) and (filename != file_to_include):
+            print(f"will be skipping {filename} as it was not in the included names")
+            continue
         fp = Path(images_root)/f"{filename}.img"
         vol = load_ss_volume2(fp,mmap=True) # should be fast and memory light?
         annotation_path = image_to_annotation_path(fp)
         ONH_info = da.from_zarr(annotation_path) # should be fast and memory light?)
-        for slice_idx in slices:
+        for i,slice_idx in enumerate(slices):
+            if max_per_vol is not None and i>= max_per_vol:
+                break
             if type(slice_idx) == list:
                 assert len(slice_idx)==2
                 slice_idx = slice_idx[0] * slice_idx[1] # permitting a conversion factor for different slice indices
@@ -522,7 +532,7 @@ def load_work_from_yaml(yaml_path,headings,images_root=C['images_root']):
 #         # executor.map preserves input order
 #         return list(ex.map(fn, items, chunksize=chunksize))
 
-def get_all_vol_paths(vol_dir,glob=None,cube_numbers=None):
+def get_all_vol_paths(vol_dir,glob=None,cube_numbers=None,use_skip_yaml=False):
     """used in the viewer and also to be used in the 02_.py file. 
     args should either have a glob or cube number, or maybe both if i refactor as such?"""
 
@@ -543,6 +553,16 @@ def get_all_vol_paths(vol_dir,glob=None,cube_numbers=None):
         )
     else:
         print('neither arg glob or numbers supplied')
+    if use_skip_yaml:
+        import yaml
+        skipper_path = "/Users/matthewhunt/Research/Iowa_Research/Han_AIR/data/example_slice_yamls/files_to_skip.yaml"
+        print(f"will be skipping vols found in {skipper_path}")
+        with open(skipper_path, "r") as f:
+            skip_names = yaml.safe_load(f) or {}
+        print(f"will be skipping names like {skip_names} ")
+        print(f"prior to skipping, the len of ALL_VOL_PATHS is {len(ALL_VOL_PATHS)}")
+        ALL_VOL_PATHS = [p for p in ALL_VOL_PATHS if not any(s in str(p) for s in skip_names)]
+        print(f"post skipping, the len of ALL_VOL_PATHS is {len(ALL_VOL_PATHS)}")
     if not ALL_VOL_PATHS:
         raise FileNotFoundError(f"No volumes in {vol_dir} matching {glob}")
     return ALL_VOL_PATHS

@@ -4,7 +4,9 @@ from typing import TYPE_CHECKING
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))  # adds Han_AIR/ to path
+from attr import asdict, dataclass
 from matplotlib.backends.backend_pdf import PdfPages
+from pathlib import Path
 
 if TYPE_CHECKING:
     from code_files.segmentation_code import segmentation_step_functions as ssf
@@ -432,12 +434,14 @@ def save_results_in_PDF(results,output_file=None):
 import math
 
 class ArrayBoard:
-    def __init__(self,skip=False,plt_display=False,dpi = 300,save_tag="",return_fig=False,ncols_max=6):
+    def __init__(self,skip=False,plt_display=False,dpi = 300,save_tag="",temp_fig_location=None,return_fig=False,ncols_max=6):
         self.items = []  # list of (array, title)
         self.skip = skip
         self.plt_display = plt_display
         self.dpi = dpi
         self.save_tag = save_tag
+        self.temp_fig_location = temp_fig_location
+
         self.return_fig = return_fig
         self.ncols_max = ncols_max
             
@@ -526,11 +530,18 @@ class ArrayBoard:
         if self.plt_display:
             plt.show()
         else:
-            self.save_tag
-            temp_fig_location = f"/Users/matthewhunt/Research/Iowa_Research/Han_AIR/results/temp_figs/ArrayBoardDisplay{self.save_tag}"
+            if self.temp_fig_location is not None:
+                temp_fig_location = self.temp_fig_location
+            else:
+                temp_fig_location = f"/Users/matthewhunt/Research/Iowa_Research/Han_AIR/results/temp_figs/ArrayBoardDisplay{self.save_tag}"
             plt.savefig(temp_fig_location)
             print(f"will be saving pdf figure at {temp_fig_location}")
         # return fig, axs
+
+def filter_small_titles_for_dict(d):
+    """we often just put dicts into our title, but we don't want arrays or lists"""
+    dc = d.copy()
+    return {k:v for k,v in dc.items() if (type(v)!=np.ndarray)}
 
 from itertools import product
 
@@ -617,3 +628,57 @@ def sweep_to_arrayboard(board, fn, *, base_kwargs: dict, grid: dict,
             else:
                 records.append({**params})
     return records
+
+
+def flatten_for_plotting(img, line_dict, flattener):
+    """as a preproc step, we flatten a bunch of lines and img to aid visualization"""
+    flat_img,shift_y_full,target_y = suf.flatten_to_path(img,flattener)
+    line_dict_flat = {k:suf.warp_line_by_shift(v,shift_y_full,direction="to_flat") 
+                      for k,v in line_dict.items()}
+    return flat_img,line_dict_flat
+
+def narrow_img_by_line(img, line_dict, adjust_by, top_pad=5, bottom_pad=5):
+    """Narrows image vertically around line_dict[adjust_by] and returns cropped image plus adjusted lines."""
+    ref = line_dict[adjust_by]
+    y0 = max(0, int(ref.min()) - top_pad)
+    y1 = min(img.shape[0], int(ref.max()) + bottom_pad + 1)
+
+    img_narrow = img[y0:y1, :]
+    line_dict_narrow = {k: v - y0 for k, v in line_dict.items()}
+
+    return img_narrow, line_dict_narrow
+
+@dataclass
+class flatNarrowPlotterLines:
+    original_method_RPE: Optional[np.ndarray] = None # = ctx.two_layer_dp_ctx.y2_rescaled,
+    choroidal_method_RPE: Optional[np.ndarray] = None # = ctx.two_layer_dp_ctx_choroidal.y1_rescaled,
+    EZ_method_RPE: Optional[np.ndarray] = None # = ctx.two_layer_dp_ctx_EZ.y2_rescaled,
+
+def prep_flat_narrow_plot(img,lines: flatNarrowPlotterLines,smoother,pad_amt=120):
+    """line dict is like
+    preshift_line_dict = dict(
+        original_method_RPE = ctx.two_layer_dp_ctx.y2_rescaled,
+        choroidal_method_RPE = ctx.two_layer_dp_ctx_choroidal.y1_rescaled,
+        EZ_method_RPE = ctx.two_layer_dp_ctx_EZ.y2_rescaled,
+    )
+
+    """
+    # -------- precompute original proposal lines once --------
+    img_flat_base, base_line_dict_flat = flatten_for_plotting(
+        img,
+        line_dict=asdict(lines),
+        flattener=smoother,
+    )
+
+    img_narrow_base, base_line_dict_narrow = narrow_img_by_line(
+        img_flat_base,
+        base_line_dict_flat,
+        adjust_by='original_method_RPE',
+        top_pad=pad_amt,
+        bottom_pad=pad_amt,
+    )
+    return img_narrow_base,base_line_dict_narrow
+
+ 
+
+

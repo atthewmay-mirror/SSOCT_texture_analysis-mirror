@@ -81,6 +81,8 @@ def _build_subprocess_cmd(
     max_workers: int = 8,
     debug: bool = False,   # <-- ADD
     run_extra_slices: bool = False,
+    z_stride: int = 1,
+    RPE_OR_ILM: str = "RPE",
 ) -> list[str]:
     mini_root = Path(mini_root) if mini_root is not None else DEFAULT_MINI_ROOT
     cmd = [
@@ -93,6 +95,8 @@ def _build_subprocess_cmd(
         "--max-workers", str(max_workers),
         "--img_src_path",str(img_src_path),
         "--z_index",str(z_index),
+        "--z_stride",str(z_stride),
+        "--RPE_OR_ILM",str(RPE_OR_ILM),
     ]
 
 
@@ -123,7 +127,9 @@ class SegmentationButton(QWidget):
     def __init__(self, viewer: napari.Viewer, mini_root: Optional[Path] = None,
                  debug_mode = False,
                 run_extra_slices = False,
-                 title = "Run ILM+RPE PDF on Current Slice"):  # flip to True when you want pdb
+                 title = "Run ILM+RPE PDF on Current Slice",
+                 z_stride=1,
+                 RPE_OR_ILM="RPE",):  # flip to True when you want pdb
         super().__init__()
         self.viewer = viewer
         self.mini_root = Path(mini_root) if mini_root else DEFAULT_MINI_ROOT
@@ -136,6 +142,8 @@ class SegmentationButton(QWidget):
         layout = QVBoxLayout()
         layout.addWidget(self.button)
         self.setLayout(layout)
+        self.z_stride = z_stride
+        self.RPE_OR_ILM = RPE_OR_ILM 
 
     def _on_click(self):
         try:
@@ -191,6 +199,8 @@ class SegmentationButton(QWidget):
                 run_extra_slices = self.run_extra_slices,
                 img_src_path=img_path,
                 z_index = z,
+                z_stride = self.z_stride,
+                RPE_OR_ILM=self.RPE_OR_ILM
 
             )
 
@@ -215,18 +225,25 @@ class SegmentationButton(QWidget):
             # raise
 
 
-def add_segmentation_button(viewer: napari.Viewer) -> SegmentationButton:
+def add_segmentation_button(viewer: napari.Viewer,z_stride=1) -> SegmentationButton:
     """Factory function you can call from your napari plugin to add the button."""
     mini_root="/Users/matthewhunt/Research/Iowa_Research/Han_AIR/data_all_volumes/"
-    widget = SegmentationButton(viewer,mini_root=mini_root,debug_mode=False,title="Run Layers on Current Slice")
+    widget = SegmentationButton(viewer,mini_root=mini_root,debug_mode=False,title="Run RPE Layers on Current Slice",z_stride=z_stride)
     viewer.window.add_dock_widget(widget, area='right', name='ILM+RPE PDF')
 
-    widget = SegmentationButton(viewer,mini_root=mini_root,debug_mode=True,title="Run Layers on Current Slice DEBUG")
-    viewer.window.add_dock_widget(widget, area='right', name='ILM+RPE PDF DEBUG')
+    widget = SegmentationButton(viewer,mini_root=mini_root,debug_mode=False,title="Run ILM Layers on Current Slice",z_stride=z_stride,RPE_OR_ILM="ILM")
+    viewer.window.add_dock_widget(widget, area='right', name='ILM PDF')
 
-    widget = SegmentationButton(viewer,mini_root=mini_root,debug_mode=False,title="Run Layers on Current+Extra Slices",run_extra_slices=True)
+
+    widget = SegmentationButton(viewer,mini_root=mini_root,debug_mode=True,title="Run RPE Layers on Current Slice DEBUG",z_stride=z_stride)
+    viewer.window.add_dock_widget(widget, area='right', name='RPE PDF DEBUG')
+
+    widget = SegmentationButton(viewer,mini_root=mini_root,debug_mode=True,title="Run ILM Layers on Current Slice DEBUG",z_stride=z_stride,RPE_OR_ILM="ILM")
+    viewer.window.add_dock_widget(widget, area='right', name='ILM PDF DEBUG')
+
+    widget = SegmentationButton(viewer,mini_root=mini_root,debug_mode=False,title="Run Layers on Current+Extra Slices",run_extra_slices=True,z_stride=z_stride)
     viewer.window.add_dock_widget(widget, area='right', name='ILM+RPE PDF Extra Slices')
 
-    widget = SegmentationButton(viewer,mini_root=mini_root,debug_mode=True,title="Run Layers on Current+Extra Slices DEBUG",run_extra_slices=True)
+    widget = SegmentationButton(viewer,mini_root=mini_root,debug_mode=True,title="Run Layers on Current+Extra Slices DEBUG",run_extra_slices=True,z_stride=z_stride)
     viewer.window.add_dock_widget(widget, area='right', name='ILM+RPE PDF Extra Slices DEBUG')
     return widget

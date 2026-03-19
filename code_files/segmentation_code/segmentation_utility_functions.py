@@ -17,7 +17,7 @@ from scipy.signal import find_peaks
 from scipy.ndimage import median_filter
 
 import cv2
-
+from dataclasses import asdict
 
 def normalize_image(img,zero_min=False):
     """assert is all postive and then norm between 0-1"""
@@ -89,6 +89,19 @@ def _blur_image(img,blur_k_x,blur_k_y,blur_type='blur'):
         blurred_img = median_filter(img, size=(blur_k_y, blur_k_x))  # 1 row tall, 51 cols wide
     return blurred_img
 
+def shift_grad(grad_img, kernel_size, shift_direction='down'):
+    shift = kernel_size // 2
+
+    if shift_direction == 'down':
+        out = np.roll(grad_img, shift, axis=0)
+        out[:shift, :] = 0
+    elif shift_direction == 'up':
+        out = np.roll(grad_img, -shift, axis=0)
+        out[-shift:, :] = 0
+    else:
+        raise ValueError("shift_direction must be 'down' or 'up'")
+
+    return out
 
 
 def _nms_columnwise(enh, radius=4, thresh=0.08, *, vertical_filter=None, value_filter=None,keeptop=True,narrow_radius_loop=False):
@@ -869,7 +882,7 @@ class peakSuppressor(object):
         if use_third_peak:
             suppressed_img = peakSuppressor.suppress_below_third_peak_valley(image_to_alter,peaks,
                                                                         factor=cfg['suppression_factor'])
-        else:
+        else: # A very interesting use case for the ILM instead
             line = peakSuppressor._peaks_to_line(peaks,W=peak_source_image.shape[1],mode='top_unless_not_top2_intensity',peak_source_image=peak_source_image)
             suppressed_img = peakSuppressor.suppress_above_below_line(image_to_alter,line,
                                                                         factor=cfg['suppression_factor'],direction='below',px_margin_to_start_suppressing=15)
@@ -882,6 +895,41 @@ class peakSuppressor(object):
             AB.render()
 
         return suppressed_img
+
+    @staticmethod
+    def peak_suppression_for_hypersmoothing(peak_source_image,ilm_line,**kwargs):
+        """peak source img and img to alter are likely the same images.
+        This pipeline works for the enh type gradient images, where you likely have a bright ILM, and bright RPE, with likely some choroidal junk below
+        For EZ-vs-RPE distinction, use the EZ_RPE_peak_suppression_pipeline
+        """
+            # bscan: (H, W) grayscale OCT B-scan
+        cfg = dict( sigma=2.0, peak_prominence=0.02, peak_distance=20, min_offset=-15, third_peak_margin=20, suppression_factor=0.1) # Some defaults that get overwritten by kwargs
+        cfg.update(kwargs)
+        # print(f"using peak_promaince as {cfg['peak_prominence']}")
+        _, peaks, _ = peakSuppressor.extract_smoothed_and_peaks(
+                                peak_source_image,
+                                sigma=cfg['sigma'],
+                                peak_prominence=cfg['peak_prominence'],   # tune per dataset
+                                peak_distance=cfg['peak_distance'],
+                                ilm_line=ilm_line,
+                                min_offset=cfg['min_offset'],
+        )
+
+        line = peakSuppressor._peaks_to_line(peaks,W=peak_source_image.shape[1],mode='topmost',peak_source_image=peak_source_image)
+        suppressed_img = peakSuppressor.suppress_above_below_line(peak_source_image,line,
+                                                                    factor=cfg['suppression_factor'],direction='below',px_margin_to_start_suppressing=15)
+        AB=spu.ArrayBoard(skip=True,plt_display=False,save_tag='testing peak line and suppression for ILM')
+        AB.add(peak_source_image,title='peak_source_img')
+        peak_img = spu.overlay_peaks_on_image(peak_source_image,peaks)
+        AB.add(peak_img,title='with peaks')
+        AB.add(peak_source_image,lines={'peak_to_line':line},title='peak_converted_to_line')
+        AB.add(suppressed_img,lines={'peak_to_line':line},title='suppressed_img')
+        AB.render()
+
+        return suppressed_img,peak_img
+
+
+    
 
 
     @staticmethod
@@ -1538,48 +1586,240 @@ def flatten_to_path(img, y_path_full, *, fill=0.0, target_y=None):
     return flat, shift_y_full, float(target_y)
 
 
+from code_files.segmentation_code.custom_dataclasses import *
 class HypersmoothPreprocessors(object):
     @staticmethod
     def _gblur(a, sigma):
         k = int(np.ceil(sigma * 6)) | 1
-        return cv2.GaussianBlur(a.astype(np.float32, copy=False), (k, k), sigma,
-                                borderType=cv2.BORDER_REPLICATE)
+        return cv2.GaussianBlur(
+            a.astype(np.float32, copy=False),
+            (k, k),
+            sigma,
+            borderType=cv2.BORDER_REPLICATE,
+        )
 
     @staticmethod
-    def _gradient(a):
-        return _normalized_axial_gradient(a,20,dark2bright=True)
-        
+    def _gradient(a, kernel_size):
+        return _normalized_axial_gradient(a, kernel_size, dark2bright=True)
+
+    @staticmethod
+    def _big_blur_grad_combined_peak_suppressed_bundle(a, p: HyperPreprocessParams) -> ImageBundle:
+        grad_raw = _boundary_enhance(
+            a,
+            vertical_kernel_size=p.kernel_size,
+            dark2bright=False,
+            blur_ksize=p.blur_sigma,
+        )
+        grad_ilm_suppressed = apply_gaussian_tube_suppression(grad_raw,guide_y = p.ILM_line,sigma= p.suppression_sigma,gain = 1)
+
+        grad_shift = shift_grad(grad_ilm_suppressed, p.kernel_size)
+        grad_shift = normalize_image(grad_shift, zero_min=True)
+
+        grad_peak_suppressed,peak_img = peakSuppressor.peak_suppression_for_hypersmoothing(
+            grad_shift,
+            p.ILM_line,
+            peak_prominence=p.peak_prominence
+        )
+        grad_peak_suppressed = normalize_image(grad_peak_suppressed,zero_min=True)
+ 
+        blurred = HypersmoothPreprocessors._gblur(a, p.blur_sigma)
+        blurred = normalize_image(blurred, zero_min=True)
+
+
+        combined_peak_suppressed = normalize_image(
+            grad_peak_suppressed * p.grad_weight + blurred * (1 - p.grad_weight),
+            zero_min=True,
+        )
+        # SOMETHING IS STILL WRONG AND NOT THE SAME AS PRIOR
+
+#     @staticmethod
+#     def _big_blur_grad_combined(a,ILM_line,kernel_size,blur_sigma,suppression_sigma,grad_weight):
+#         grad_suppressed = HypersmoothPreprocessors._big_blur_grad_ILM_suppressed(a,ILM_line,kernel_size,blur_sigma,suppression_sigma,grad_weight)
+#         grad_shift = shift_grad_down(grad_suppressed,kernel_size)
+#         blurred = HypersmoothPreprocessors._gblur(a,blur_sigma)
+
+#         grad_shift = normalize_image(grad_shift,zero_min=True)
+#         blurred = normalize_image(blurred,zero_min=True)
+#         # product = normalize_image(grad_shift*blurred,zero_min=True)
+#         product = normalize_image(grad_shift*grad_weight + blurred*(1-grad_weight),zero_min=True)
+#         return product
+
+#     @staticmethod
+#     def _big_blur_grad_combined_peak_suppressed(a,ILM_line,kernel_size,blur_sigma,suppression_sigma,grad_weight):
+#         grad_suppressed = HypersmoothPreprocessors._big_blur_grad_ILM_suppressed(a,ILM_line,kernel_size,blur_sigma,suppression_sigma,grad_weight)
+#         grad_shift = shift_grad_down(grad_suppressed,kernel_size)
+#         blurred = HypersmoothPreprocessors._gblur(a,blur_sigma)
+
+#         grad_shift = normalize_image(grad_shift,zero_min=True)
+#         grad_shift = peakSuppressor.peak_suppression_for_hypersmoothing(grad_shift,ILM_line)
+#         blurred = normalize_image(blurred,zero_min=True)
+#         output = normalize_image(grad_shift*grad_weight + blurred*(1-grad_weight),zero_min=True)
+#         return output
+
+
+
+
+
+
+        # combined = normalize_image(
+        #     grad_shift * p.grad_weight + blurred_norm * (1 - p.grad_weight),
+        #     zero_min=True,
+        # )
+
+
+        return ImageBundle(
+            output=combined_peak_suppressed,
+            blurred=blurred,
+            grad_raw=grad_raw,
+            grad_shift=grad_shift,
+            grad_peak_suppressed=grad_peak_suppressed,
+            peak_img=peak_img,
+            grad_ilm_suppressed=grad_ilm_suppressed,
+            # combined=combined,
+            combined_peak_suppressed=combined_peak_suppressed,
+        )
+
+
+# class HypersmoothPreprocessors(object):
+#     @staticmethod
+#     def _gblur(a, sigma):
+#         k = int(np.ceil(sigma * 6)) | 1
+#         return cv2.GaussianBlur(a.astype(np.float32, copy=False), (k, k), sigma,
+#                                 borderType=cv2.BORDER_REPLICATE)
+
+#     @staticmethod
+#     def _gradient(a):
+#         return _normalized_axial_gradient(a,20,dark2bright=True)
+
+#     @staticmethod
+#     def _big_blur_grad_ILM_suppressed(a,ILM_line,kernel_size,blur_sigma,suppression_sigma,grad_weight):
+#         enh = _boundary_enhance(
+#             a,
+#             vertical_kernel_size=kernel_size,
+#             dark2bright=False,
+#             blur_ksize=blur_sigma,
+#         )
+#         suppressed = apply_gaussian_tube_suppression(enh,guide_y = ILM_line,sigma= suppression_sigma,gain = 1)
+
+#         return suppressed
+
+#     @staticmethod
+#     def _big_blur_grad_combined(a,ILM_line,kernel_size,blur_sigma,suppression_sigma,grad_weight):
+#         grad_suppressed = HypersmoothPreprocessors._big_blur_grad_ILM_suppressed(a,ILM_line,kernel_size,blur_sigma,suppression_sigma,grad_weight)
+#         grad_shift = shift_grad_down(grad_suppressed,kernel_size)
+#         blurred = HypersmoothPreprocessors._gblur(a,blur_sigma)
+
+#         grad_shift = normalize_image(grad_shift,zero_min=True)
+#         blurred = normalize_image(blurred,zero_min=True)
+#         # product = normalize_image(grad_shift*blurred,zero_min=True)
+#         product = normalize_image(grad_shift*grad_weight + blurred*(1-grad_weight),zero_min=True)
+#         return product
+
+#     @staticmethod
+#     def _big_blur_grad_combined_peak_suppressed(a,ILM_line,kernel_size,blur_sigma,suppression_sigma,grad_weight):
+#         grad_suppressed = HypersmoothPreprocessors._big_blur_grad_ILM_suppressed(a,ILM_line,kernel_size,blur_sigma,suppression_sigma,grad_weight)
+#         grad_shift = shift_grad_down(grad_suppressed,kernel_size)
+#         blurred = HypersmoothPreprocessors._gblur(a,blur_sigma)
+
+#         grad_shift = normalize_image(grad_shift,zero_min=True)
+#         grad_shift = peakSuppressor.peak_suppression_for_hypersmoothing(grad_shift,ILM_line)
+#         blurred = normalize_image(blurred,zero_min=True)
+#         output = normalize_image(grad_shift*grad_weight + blurred*(1-grad_weight),zero_min=True)
+#         return output
+
+
+
+
+
 
 
 def rpe_hypersmoother_DP(img, 
                                         rigidity = 40,
-                                        ds_y = 8,
-                                        ds_x = 8,
+                                        # rigidity = 2,
+                                        ds_y = 1,
+                                        ds_x = 1,
                                         max_step = 5,
                                         lambda_step = 0,
                                         preprocess_function = HypersmoothPreprocessors._gblur,
                                         preprocess_kwargs = {'sigma' : 4.0},
-                                        ctx=None):
+                                        ctx=None,
+                                        ONH_info = None,
+                                        return_cost=False):
     """Heavy blur/downsample -> cost -> DP path -> smooth path -> (later) flatten to that path.
     Returns: coarse image and path run upon that coarse image, after upsampling. Later function will flatten it hypersmoother_params
+
+    3/7/26: this will likely now just run for the ILM, and really should be refactored to use the below
     """
     # fill = 0.0
 
     H, W = img.shape
 
-    coarse = preprocess_function(img[::ds_y, ::ds_x], **preprocess_kwargs).astype(np.float32, copy=False)
+    assert ds_y ==ds_x
+    if ds_x != 1:
+        img = img[::ds_y, ::ds_x]
+    if ONH_info is not None:
+        # rescale by the ratio
+        dscale_factor = ONH_info.shape[1]/img.shape[1] # Should be integer really
+        ONH_info = ONH_info[::dscale_factor,::dscale_factor]
+
+    coarse = preprocess_function(img, **preprocess_kwargs).astype(np.float32, copy=False)
     coarse /= (coarse.max() + 1e-7)
     Hc, Wc = coarse.shape
 
     cost = -coarse
-    y_dp, C = run_DP_on_cost_matrix(cost, max_step=max_step, lambda_step=lambda_step)
+    if ONH_info is not None:
+        cost = modify_cost_with_ONH_info(cost,ONH_region=ONH_info,ONH_value_factor=0.5)
+    y_dp, C = run_DP_on_cost_matrix(cost, max_step=max_step, lambda_step=lambda_step,lambda_step_in_ONH_region=0.0001)
     y_dp = smooth_rpe_line(y_dp, rigidity=rigidity)
 
     x_c = np.arange(Wc, dtype=np.float32)
     x_f = np.linspace(0, Wc - 1, W, dtype=np.float32)
     y_path_full = (np.interp(x_f, x_c, y_dp.astype(np.float32)).astype(np.float32) * ds_y)
 
+    if return_cost:
+        return coarse,y_path_full,y_dp,cost
+
     return coarse,y_path_full,y_dp
+
+
+from code_files.segmentation_code.custom_dataclasses import *
+def rpe_hypersmoother_DP_3_7_26(
+    coarse,
+    rigidity=10,
+    max_step=5,
+    lambda_step=0,
+    ONH_info=None,
+    lambda_step_in_ONH_region=0.0001,
+):
+    """Run DP on an already-preprocessed image."""
+
+    coarse = coarse.astype(np.float32, copy=False)
+    coarse /= (coarse.max() + 1e-7)
+
+    cost = -coarse
+
+    if ONH_info is not None:
+        dscale_factor = ONH_info.shape[1]/coarse.shape[1] # Should be integer really
+        ONH_info = ONH_info[::dscale_factor,::dscale_factor]
+        cost = modify_cost_with_ONH_info(
+            cost,
+            ONH_region=ONH_info,
+            ONH_value_factor=0.5,
+        )
+
+    # print(f"should be using lambda step of {lambda_step_in_ONH_region}")
+    y_dp, C = run_DP_on_cost_matrix(
+        cost,
+        max_step=max_step,
+        lambda_step=lambda_step,
+        ONH_region=ONH_info,
+        lambda_step_in_ONH_region=lambda_step_in_ONH_region,
+    )
+    smoothed_y_dp = smooth_rpe_line(y_dp, rigidity=rigidity)
+
+    return coarse, y_dp, smoothed_y_dp,cost
+
+
 
 
 
@@ -2145,6 +2385,7 @@ def apply_gaussian_tube_suppression(
 ) -> np.ndarray:
     """
     instead this does the opposite, performing subtraction of a value, and then zeroing everything less than zero. Used to soft-zero an area around a line.
+    Suppress around the ILM with this
     img: (H,W) float or uint image
     guide_y: (W,) y-coordinates (row index) with np.nan for missing
     """
@@ -3379,3 +3620,31 @@ def barrier_integral_to_i(Bcs_col: np.ndarray, ks: np.ndarray, i: int) -> np.nda
     # prefix sum convention: Bcs[y] = sum_{t<=y} barrier[t]
     out = Bcs_col[hi] - np.where(lo > 0, Bcs_col[lo - 1], 0.0)
     return out
+
+
+def refine_line_by_brightness(original_image, blur_kernel_size, proposed_line, up_range, down_range):
+    """our final vertical shifting step"""
+    img = original_image.astype(np.float32, copy=False)
+
+    if blur_kernel_size % 2 == 0:
+        blur_kernel_size += 1
+
+    blurred = cv2.GaussianBlur(img, (blur_kernel_size, blur_kernel_size), 0)
+
+    line = np.asarray(proposed_line).astype(np.int32)
+    H, W = blurred.shape
+    x = np.arange(W)
+
+    best_score = -np.inf
+    best_shift = 0
+    best_line = line.copy()
+
+    for shift in range(-up_range, down_range + 1):
+        y = np.clip(line + shift, 0, H - 1)
+        score = blurred[y, x].sum()
+        if score > best_score:
+            best_score = score
+            best_shift = shift
+            best_line = y.copy()
+
+    return best_line, best_shift, best_score, blurred

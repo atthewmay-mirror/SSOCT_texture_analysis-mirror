@@ -139,7 +139,11 @@ def process_bscan_1_3_26(idx_and_img,production_mode,rpe_seg_steps,ilm_seg_steps
                         highres_cfg=highres_rpe_config,
                         highres_ctx=highres_rpe_context,
                         two_layer_dp_ctx=two_layer_dp_context,
-                        ilm_seg=ilm_ctx.ilm_raw,
+                        two_layer_dp_ctx_choroidal=ssf.twoLayerDPContext(),
+                        two_layer_dp_ctx_EZ=ssf.twoLayerDPContext(),
+                        # ilm_seg=ilm_ctx.ilm_raw,
+                        ilm_seg=ilm_ctx.ilm_smooth,
+                        ilm_ctx=ilm_ctx,
                         ONH_region=ONH_info)
     rpe_ctx = ssf.run_pipeline(rpe_ctx,steps=rpe_seg_steps)
     # print(rpe_ctx.highres_cfg)
@@ -412,7 +416,7 @@ RPE_STEPS_2_28_26: List[ssf.RPEStepFn] = [ # Exploring the addition of a horizon
     ssf.step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2,
     ssf.step_rpe_highres_DP_two_layer,
     ssf.step_rpe_highres_unsmooth,
-    # ssf.step_rpe_endpoint_plot,
+    ssf.step_rpe_endpoint_plot,
 ]
 RPE_STEPS_2_28_26 = ssf.filter_pipeline(RPE_STEPS_2_28_26 )
 
@@ -425,6 +429,155 @@ ILM_STEPS_2_28 : List[ssf.ILMStepFn] = [
     ssf.step_ilm_DP,
     ssf.step_ilm_DP_refiner,
     ssf.step_ilm_upsample,
+    # ssf.ckpt(ssf.step_ilm_unsmooth,overwrite=True,save_by_ID=True),
     ssf.step_ilm_unsmooth,
     # ssf.step_ilm_endpoint_plot,
 ]
+
+def gen_ILM_STEPS_2_28(overwrite=True):
+    ILM_STEPS_2_28 : List[ssf.ILMStepFn] = [
+        ssf.step_ilm_hypersmoother,
+        ssf.step_ilm_downsample_and_preprocess,
+        ssf.step_ilm_compute_enhancement,
+        ssf.step_ilm_peak_suppression,
+        ssf.step_ilm_ax_grad_thinner,
+        ssf.step_ilm_DP,
+        ssf.step_ilm_DP_refiner,
+        ssf.step_ilm_upsample,
+        # ssf.step_ilm_unsmooth,overwrite=True,save_by_ID=True),
+        ssf.ckpt(ssf.step_ilm_unsmooth,overwrite=overwrite,save_by_ID=True,type='ILM'),
+        # ssf.step_ilm_endpoint_plot,
+    ]
+    ILM_STEPS_2_28 = ssf.filter_pipeline(ILM_STEPS_2_28)
+    return ILM_STEPS_2_28
+
+
+
+# The above is amazing, however the hypersmoother still needs work. 
+RPE_STEPS_3_7_26: List[ssf.RPEStepFn] = [ # Exploring the addition of a horizontal gradient
+    ssf.step_rpe_init_working,
+    ssf.step_rpe_hypersmoother_3_7_26,
+    ssf.step_rpe_downsample_and_preprocess,
+    ssf.step_rpe_compute_enhancement2,
+    ssf.step_rpe_DP_on_enh_2,
+    ssf.step_rpe_upsample,
+    ssf.step_rpe_unsmooth,
+
+    ssf.step_rpe_highres_smooth,
+    ssf.step_rpe_highres_diff_enh,
+    ssf.step_rpe_highres_peak_suppress_to_rpe_refined,
+    ssf.step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2,
+    ssf.step_rpe_highres_DP_two_layer,
+    ssf.step_rpe_highres_unsmooth,
+    ssf.step_rpe_endpoint_plot,
+
+
+]
+
+# The following is an experiment to try enabling both choroidal and EZ refining pathways
+# Choroidal first. 
+RPE_STEPS_CHOROIDAL_3_9_26: List[ssf.RPEStepFn] = [ # Exploring the addition of a horizontal gradient
+    ssf.step_rpe_init_working,
+    ssf.step_rpe_hypersmoother_3_7_26,
+    ssf.step_rpe_downsample_and_preprocess,
+    ssf.step_rpe_compute_enhancement2,
+    ssf.step_rpe_DP_on_enh_2,
+    ssf.step_rpe_upsample,
+    ssf.step_rpe_unsmooth,
+
+    ssf.step_rpe_highres_smooth,
+    ssf.step_rpe_highres_diff_enh,
+    # ssf.step_rpe_highres_peak_suppress_to_rpe_refined,
+    # ssf.step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2,
+    ssf.ckpt(ssf.step_rpe_highres_DP_two_layer,overwrite=True,
+             save_by_ID=True),
+    ssf.step_rpe_highres_DP_two_layer_choroidal,
+    ssf.step_rpe_highres_unsmooth,    # ssf.step_ilm_unsmooth,overwrite=True,save_by_ID=True),
+
+    # Choroidal specific steps here
+
+    ssf.step_rpe_choroidal_EZ_endpoint_plot,
+
+
+]
+
+RPE_STEPS_CHOROIDAL_3_9_26 = ssf.filter_pipeline(RPE_STEPS_CHOROIDAL_3_9_26 )
+
+RPE_STEPS_EZ_3_9_26: List[ssf.RPEStepFn] = [ # Exploring the addition of a horizontal gradient
+    ssf.step_rpe_init_working,
+    ssf.step_rpe_hypersmoother_3_7_26,
+    ssf.step_rpe_downsample_and_preprocess,
+    ssf.step_rpe_compute_enhancement2,
+    ssf.step_rpe_DP_on_enh_2,
+    ssf.step_rpe_upsample,
+    ssf.step_rpe_unsmooth,
+
+    ssf.step_rpe_highres_smooth,
+    ssf.step_rpe_highres_diff_enh,
+    # ssf.step_rpe_highres_peak_suppress_to_rpe_refined,
+    # ssf.step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2,
+    # ssf.step_rpe_highres_DP_two_layer,
+    ssf.ckpt(ssf.step_rpe_highres_DP_two_layer,overwrite=False,save_by_ID=True),
+    # ssf.ckpt(ssf.step_rpe_highres_unsmooth,overwrite=False,save_by_ID=True),
+    # ssf.step_ilm_unsmooth,overwrite=True,save_by_ID=True),
+    # ssf.step_rpe_EZ_egs_two_layer_prep, # this was a debug step
+    # ssf.step_rpe_highres_DP_two_layer_EZ,
+    ssf.step_rpe_highres_DP_two_layer_EZ_DEBUG,
+
+    # EZ specific steps here
+
+    # ssf.step_rpe_EZ_EZ_endpoint_plot,
+
+
+]
+
+RPE_STEPS_EZ_3_9_26 = ssf.filter_pipeline(RPE_STEPS_EZ_3_9_26 )
+
+
+def gen_RPE_STEPS_unified_3_13_26(overwrite):
+    RPE_STEPS_unified_3_13_26: List[ssf.RPEStepFn] = [ # Exploring the addition of a horizontal gradient
+        ssf.step_rpe_init_working,
+        ssf.step_rpe_hypersmoother_3_7_26,
+        ssf.step_rpe_downsample_and_preprocess,
+        ssf.step_rpe_compute_enhancement2,
+        ssf.step_rpe_DP_on_enh_2,
+        ssf.step_rpe_upsample,
+        ssf.step_rpe_unsmooth,
+
+        ssf.step_rpe_highres_smooth,
+        ssf.step_rpe_highres_diff_enh,
+        # ssf.step_rpe_highres_peak_suppress_to_rpe_refined,
+        # ssf.step_rpe_highres_higher_res_gradient_guided_DP_to_rpe_refined2,
+        # ssf.step_rpe_highres_DP_two_layer,
+        ssf.step_rpe_highres_DP_two_layer,
+        ssf.step_rpe_highres_DP_two_layer_choroidal,
+        ssf.step_rpe_highres_DP_two_layer_EZ,
+        ssf.step_rpe_highres_unsmooth,    # ssf.step_ilm_unsmooth,overwrite=True,save_by_ID=True),
+        ssf.ckpt(ssf.step_rpe_vertical_shift_refine,overwrite=overwrite,save_by_ID=True,type='RPE'),
+        ssf.step_rpe_vertical_shift_refine, # repeat and save teh computation
+        ssf.step_rpe_choroidal_EZ_endpoint_plot,
+    ]
+
+    RPE_STEPS_unified_3_13_26= ssf.filter_pipeline(RPE_STEPS_unified_3_13_26)
+    return RPE_STEPS_unified_3_13_26
+
+
+# The run-ready version of the above
+RPE_STEPS_unified_3_19_26: List[ssf.RPEStepFn] = [ # Exploring the addition of a horizontal gradient
+    ssf.step_rpe_init_working,
+    ssf.step_rpe_hypersmoother_3_7_26,
+    ssf.step_rpe_downsample_and_preprocess,
+    ssf.step_rpe_compute_enhancement2,
+    ssf.step_rpe_DP_on_enh_2,
+    ssf.step_rpe_upsample,
+    ssf.step_rpe_unsmooth,
+
+    ssf.step_rpe_highres_smooth,
+    ssf.step_rpe_highres_diff_enh,
+    ssf.step_rpe_highres_DP_two_layer,
+    ssf.step_rpe_highres_DP_two_layer_choroidal,
+    ssf.step_rpe_highres_DP_two_layer_EZ,
+    ssf.step_rpe_highres_unsmooth,    # ssf.step_ilm_unsmooth,overwrite=True,save_by_ID=True),
+    ssf.step_rpe_vertical_shift_refine, # repeat and save teh computation
+]
+RPE_STEPS_unified_3_13_26= ssf.filter_pipeline(RPE_STEPS_unified_3_13_26)
