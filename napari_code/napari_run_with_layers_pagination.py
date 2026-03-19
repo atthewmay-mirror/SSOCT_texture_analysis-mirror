@@ -213,12 +213,38 @@ def ensure_labels_zarr(vol_path: Path, z_stride: int,overwrite: bool,layers_root
         # write_volume_to_zarr_streaming(lbl_vol.astype(np.uint8, copy=False), labels_zarr, (1, H, W))
 
 
+        # LABEL_SETS = {
+        #     # "ilm_rpe_refined": ["ilm_smooth", "rpe_refined1", "rpe_refined2"],
+        #     "ilm_rpe_refined": ["ilm_smooth", "rpe_smooth2"],
+        #     "rpe_family":      ["rpe_raw", "rpe_smooth", "hypersmoother_path"],
+        #     "two_layer_family":      ["y1_rescaled", "y2_rescaled","rpe_smooth2"],
+        # }
+
         LABEL_SETS = {
-            # "ilm_rpe_refined": ["ilm_smooth", "rpe_refined1", "rpe_refined2"],
-            "ilm_rpe_refined": ["ilm_smooth", "rpe_smooth2"],
-            "rpe_family":      ["rpe_raw", "rpe_smooth", "hypersmoother_path"],
-            "two_layer_family":      ["y1_rescaled", "y2_rescaled","rpe_smooth2"],
+            'basics':["hypersmoother_path", "rpe_smooth", "ilm_raw", "ilm_smooth"],
+            'ILM':["ilm_raw", "ilm_smooth"],
+            'two_layer_original': [
+                # 'original_method_y1_rescaled',
+                # 'original_method_y2_rescaled',
+                'original_method_y1_vertical_shifted',
+                'original_method_y2_vertical_shifted',
+            ],
+            'two_layer_choroidal': [ 
+                # 'choroidal_method_y1_rescaled',
+                # 'choroidal_method_y2_rescaled',
+                'choroidal_method_y1_vertical_shifted',
+                'choroidal_method_y2_vertical_shifted',],
+            'two_layer_EZ': [ 
+                    # 'EZ_method_y1_rescaled',
+                    # 'EZ_method_y2_rescaled',
+                    'EZ_method_y1_vertical_shifted',
+                    'EZ_method_y2_vertical_shifted'],
+            'all_methods_RPE':[
+                'original_method_y2_vertical_shifted',
+                'choroidal_method_y1_vertical_shifted',
+                'EZ_method_y2_vertical_shifted'],
         }
+ 
  
         vols = {}
         for set_name, names in LABEL_SETS.items():
