@@ -4,7 +4,6 @@ import sys
 from pathlib import Path
 from token import OP
 
-from pkg_resources import resource_listdir
 sys.path.append(str(Path(__file__).resolve().parents[1]))  # adds Han_AIR/ to path
 import code_files.segmentation_code.segmentation_utility_functions as suf
 import code_files.segmentation_code.segmentation_plot_utils as spu
