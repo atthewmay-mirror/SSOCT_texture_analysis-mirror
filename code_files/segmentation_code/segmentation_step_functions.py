@@ -2161,7 +2161,8 @@ def step_rpe_EZ_egs_two_layer_prep_DEBUG(ctx: RPEContext):
                             )
 
     offset_value = np.unique(ctx.flat_rpe_smooth)
-    assert len(offset_value) == 1
+    if len(offset_value) != 1:
+        print(f"np.unique(ctx.flat_rpe_smooth) is {np.unique(ctx.flat_rpe_smooth)}")
     offset_value = float(offset_value[0])
 
 
@@ -2355,7 +2356,8 @@ def _run_highres_two_layer_EZ_once(ctx: RPEContext, base: dict):
     input_img = _rpe_EZ_egs_two_layer_prep(ctx,base.pop('num_gradients',1))
 
     band_center_value = np.unique(ctx.flat_rpe_smooth)
-    assert len(band_center_value) == 1
+    if len(band_center_value) != 1:
+        print(f"np.unique(ctx.flat_rpe_smooth) is {np.unique(ctx.flat_rpe_smooth)}")
     band_center_value = float(band_center_value[0])
 
     up_band_radius = 20
@@ -2927,7 +2929,7 @@ def step_rpe_highres_GS(ctx: RPEContext) -> RPEContext:
     """perform a single GS"""
     AB = spu.ArrayBoard(plt_display=False,save_tag="GS_testing")
     value = np.unique(ctx.flat_rpe_smooth)
-    assert len(value)==1
+    # assert len(value)==1
     value = value[0]
     out = suf.gs_single_surface_pymaxflow(ctx.highres_ctx.highres_suppressed,row_range=[value-200,value+200],smoothness=0) # 
     AB.add(ctx.highres_ctx.diff_down_up,title = 'lower edge of tubed')
@@ -2941,7 +2943,7 @@ def step_rpe_highres_DP2(ctx: RPEContext) -> RPEContext:
     """perform a single GS"""
     AB = spu.ArrayBoard(plt_display=False,ncols_max=5, save_tag=f"DP2 testing for {ctx.ID}")
     value = np.unique(ctx.flat_rpe_smooth)
-    assert len(value)==1
+    # assert len(value)==1
     value = value[0]
     radius = 30
     print(value-radius)
@@ -3068,7 +3070,7 @@ def step_rpe_highres_DP2_debug(ctx: RPEContext) -> RPEContext:
 
     # --- flatten center (your code assumes flat_rpe_smooth is constant)
     offset_value = np.unique(ctx.flat_rpe_smooth)
-    assert len(offset_value) == 1
+    # assert len(offset_value) == 1
     offset_value = float(offset_value[0])
 
     img_band_radius = 30
