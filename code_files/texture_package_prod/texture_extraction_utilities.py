@@ -1,0 +1,534 @@
+
+#REVIEWED!
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import partial
+
+import numpy as np
+from joblib import Parallel, delayed
+from scipy import ndimage
+from scipy.stats import entropy as scipy_entropy
+from skimage.feature import graycomatrix, graycoprops, local_binary_pattern
+from skimage.transform import resize
+from skimage.measure import label as cc_label
+
+# from .vessel_texture_postproc_utils import estimate_shadow_mask_from_bscan, postprocess_feature_dict
+
+
+@dataclass
+class DenseMapMeta:
+    row_centers: np.ndarray
+    col_centers: np.ndarray
+    window: int
+    step: int
+    image_shape: tuple[int, int]
+
+
+GLCM_FEATURES = ('contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation', 'ASM')
+
+
+def robust_rescale_uint(image: np.ndarray, levels: int = 32, clip_percentiles: tuple[float, float] = (1, 99)) -> np.ndarray:
+    """Robustly rescale to integer gray levels."""
+    img = image.astype(np.float32)
+    lo, hi = np.nanpercentile(img, clip_percentiles)
+    img = np.clip(img, lo, hi)
+    if hi <= lo:
+        return np.zeros_like(img, dtype=np.uint8)
+    img = (img - lo) / (hi - lo)
+    return np.clip(np.round(img * (levels - 1)), 0, levels - 1).astype(np.uint8)
+
+
+# ---------- small patch features ----------
+
+def _nanmean_std_percentiles(values: np.ndarray) -> dict[str, float]:
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {'mean': np.nan, 'std': np.nan, 'p10': np.nan, 'p50': np.nan, 'p90': np.nan}
+    hist, _ = np.histogram(values, bins=32)
+    probs = hist / max(hist.sum(), 1)
+    return {
+        'mean': float(np.nanmean(values)),
+        'std': float(np.nanstd(values)),
+        'entropy': float(scipy_entropy(probs + 1e-12, base=2)),
+        'p10': float(np.nanpercentile(values, 10)),
+        'p50': float(np.nanpercentile(values, 50)),
+        'p90': float(np.nanpercentile(values, 90)),
+    }
+
+
+def glcm_features_patch(patch_q: np.ndarray, levels: int = 32) -> dict[str, float]:
+    glcm = graycomatrix(
+        patch_q,
+        distances=[1], # EDIT? We may want longer range dependencies. The out would have to be named by the distnacees I think.
+        angles=[0, np.pi / 4, np.pi / 2, 3 * np.pi / 4],
+        levels=levels,
+        symmetric=True,
+        normed=True,
+    )
+    out = {f'glcm_{name}': float(graycoprops(glcm, name).mean()) for name in GLCM_FEATURES}
+    p = glcm.astype(np.float64)
+    out['glcm_entropy'] = float((-(p * np.log2(p + 1e-12))).sum(axis=(0, 1)).mean())
+    return out
+
+
+def _iter_lines(q: np.ndarray, angle: int):
+    if angle == 0:
+        for row in q:
+            yield row
+    elif angle == 90:
+        for col in q.T:
+            yield col
+    elif angle == 45:
+        for k in range(-q.shape[0] + 1, q.shape[1]):
+            yield np.diagonal(np.fliplr(q), offset=k)
+    elif angle == 135:
+        for k in range(-q.shape[0] + 1, q.shape[1]):
+            yield np.diagonal(q, offset=k)
+    else:
+        raise ValueError(angle)
+
+
+def _run_length_matrix(q: np.ndarray, levels: int = 32, angles: tuple[int, ...] = (0, 45, 90, 135)) -> np.ndarray:
+    """This function builds a GLRLM: a gray-level run-length matrix.
+
+    What that means:
+
+    rows = gray level
+    columns = run length
+    entry (g, r) = how many times you saw a run of gray level g with length r+1
+
+    A “run” means consecutive equal-valued pixels along some direction."""
+    max_run = max(q.shape)
+    mats = []
+    for angle in angles:
+        mat = np.zeros((levels, max_run), dtype=np.float64)
+        for line in _iter_lines(q, angle):
+            if line.size == 0:
+                continue
+            start = 0
+            for i in range(1, len(line) + 1):
+                if i == len(line) or line[i] != line[start]:
+                    gray = int(line[start])
+                    run = i - start
+                    mat[gray, run - 1] += 1
+                    start = i
+        mats.append(mat)
+    return np.mean(mats, axis=0)
+
+
+def glrlm_features_patch(patch_q: np.ndarray, levels: int = 32) -> dict[str, float]:
+    p = _run_length_matrix(patch_q, levels=levels)
+    total = p.sum()
+    if total == 0:
+        return {k: np.nan for k in ('glrlm_sre', 'glrlm_lre', 'glrlm_gln', 'glrlm_rln', 'glrlm_rp')}
+    runs = np.arange(1, p.shape[1] + 1)[None, :]
+    gray_sums = p.sum(axis=1)
+    run_sums = p.sum(axis=0)
+    return {
+        'glrlm_sre': float((p / (runs * runs)).sum() / total),
+        'glrlm_lre': float((p * (runs * runs)).sum() / total),
+        'glrlm_gln': float((gray_sums * gray_sums).sum() / total),
+        'glrlm_rln': float((run_sums * run_sums).sum() / total),
+        'glrlm_rp': float(total / patch_q.size),
+    }
+
+
+def glszm_features_patch(patch_q: np.ndarray, levels: int = 32) -> dict[str, float]:
+    max_zone = patch_q.size
+    p = np.zeros((levels, max_zone), dtype=np.float64)
+    for gray in np.unique(patch_q):
+        cc = cc_label(patch_q == gray, connectivity=2)
+        if cc.max() == 0:
+            continue
+        sizes = np.bincount(cc.ravel())[1:]
+        for s in sizes:
+            p[int(gray), s - 1] += 1
+    total = p.sum()
+    if total == 0:
+        return {k: np.nan for k in ('glszm_sze', 'glszm_lze', 'glszm_gln', 'glszm_zsn')}
+    zones = np.arange(1, p.shape[1] + 1)[None, :]
+    return {
+        'glszm_sze': float((p / (zones * zones)).sum() / total),
+        'glszm_lze': float((p * (zones * zones)).sum() / total),
+        'glszm_gln': float(((p.sum(axis=1) ** 2).sum()) / total),
+        'glszm_zsn': float(((p.sum(axis=0) ** 2).sum()) / total),
+    }
+
+
+def gldm_features_patch(patch_q: np.ndarray, levels: int = 32, delta: int = 1) -> dict[str, float]:
+    pad = np.pad(patch_q, 1, mode='edge')
+    dep = np.zeros_like(patch_q, dtype=np.int32)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            nei = pad[1 + dr:1 + dr + patch_q.shape[0], 1 + dc:1 + dc + patch_q.shape[1]]
+            dep += (np.abs(nei.astype(int) - patch_q.astype(int)) <= delta)
+    dep += 1
+    max_dep = dep.max()
+    p = np.zeros((levels, max_dep), dtype=np.float64)
+    for g in range(levels):
+        m = patch_q == g
+        if m.any():
+            counts = np.bincount(dep[m], minlength=max_dep + 1)[1:]
+            p[g, :len(counts)] += counts
+    total = p.sum()
+    if total == 0:
+        return {k: np.nan for k in ('gldm_sde', 'gldm_lde', 'gldm_gln', 'gldm_dnu')}
+    deps = np.arange(1, p.shape[1] + 1)[None, :]
+    return {
+        'gldm_sde': float((p / (deps * deps)).sum() / total),
+        'gldm_lde': float((p * (deps * deps)).sum() / total),
+        'gldm_gln': float(((p.sum(axis=1) ** 2).sum()) / total),
+        'gldm_dnu': float(((p.sum(axis=0) ** 2).sum()) / total),
+    }
+
+
+def ngtdm_features_patch(patch_q: np.ndarray, levels: int = 32) -> dict[str, float]:
+    q = patch_q.astype(np.float32)
+    k = 3
+    neigh_sum = ndimage.uniform_filter(q, size=k, mode='nearest') * (k * k)
+    neigh_mean = (neigh_sum - q) / (k * k - 1)
+    s = np.zeros(levels, dtype=np.float64)
+    n = np.zeros(levels, dtype=np.float64)
+    for g in range(levels):
+        m = patch_q == g
+        if m.any():
+            s[g] = np.abs(q[m] - neigh_mean[m]).sum()
+            n[g] = m.sum()
+    N = n.sum()
+    if N == 0:
+        return {k: np.nan for k in ('ngtdm_coarseness', 'ngtdm_contrast', 'ngtdm_busyness', 'ngtdm_complexity', 'ngtdm_strength')}
+    p = n / N # proportion at each gray level in n
+    gs = np.arange(levels, dtype=np.float64)
+    ii, jj = np.meshgrid(gs, gs, indexing='ij')
+    pi, pj = np.meshgrid(p, p, indexing='ij')
+    diff = np.abs(ii - jj)
+    ng = max(int((n > 0).sum()), 1)
+    coarseness = 1.0 / max((p * s).sum(), 1e-8) # higher is smoother
+    contrast = (pi * pj * diff * diff).sum() * s.sum() / max(ng * (ng - 1) * N, 1e-8)
+    busyness = (p * s).sum() / max(np.abs((gs[:, None] * pi) - (gs[None, :] * pj)).sum(), 1e-8)
+    complexity = (diff * (pi * s[:, None] + pj * s[None, :]) / (pi + pj + 1e-8)).sum() / max(N, 1e-8)
+    strength = ((pi + pj) * diff * diff).sum() / max(s.sum(), 1e-8)
+    return {
+        'ngtdm_coarseness': float(coarseness),
+        'ngtdm_contrast': float(contrast),
+        'ngtdm_busyness': float(busyness),
+        'ngtdm_complexity': float(complexity),
+        'ngtdm_strength': float(strength),
+    }
+
+
+def lbp_features_patch(patch: np.ndarray) -> dict[str, float]:
+    patch_u = robust_rescale_uint(patch, levels=32)
+    lbp = local_binary_pattern(patch_u, P=8, R=1, method='uniform')
+    hist, _ = np.histogram(lbp, bins=np.arange(12), density=True)
+    return {
+        'lbp_mean': float(lbp.mean()),
+        'lbp_std': float(lbp.std()),
+        'lbp_entropy': float(scipy_entropy(hist + 1e-12, base=2)),
+        'lbp_uniformity': float((hist * hist).sum()),
+    }
+
+
+def gradient_orientation_features_patch(patch: np.ndarray) -> dict[str, float]:
+    gx = ndimage.sobel(patch, axis=1)
+    gy = ndimage.sobel(patch, axis=0)
+    mag = np.hypot(gx, gy)
+    jxx = ndimage.gaussian_filter(gx * gx, 1.0).mean()
+    jyy = ndimage.gaussian_filter(gy * gy, 1.0).mean()
+    jxy = ndimage.gaussian_filter(gx * gy, 1.0).mean()
+    tr = jxx + jyy
+    det = (jxx - jyy) ** 2 + 4 * jxy * jxy
+    lam1 = 0.5 * (tr + np.sqrt(max(det, 0.0)))
+    lam2 = 0.5 * (tr - np.sqrt(max(det, 0.0)))
+    coherence = (lam1 - lam2) / max(lam1 + lam2, 1e-8)
+    return {
+        'grad_mean': float(mag.mean()),
+        'grad_std': float(mag.std()),
+        'orientation_coherence': float(coherence),
+    }
+
+
+# ---------- filters ----------
+
+def haar_like_bands(image: np.ndarray) -> dict[str, np.ndarray]:
+    """Full-resolution Haar-like bands using separable low/high kernels."""
+    img = image.astype(np.float32)
+    low = np.array([0.5, 0.5], dtype=np.float32)
+    high = np.array([0.5, -0.5], dtype=np.float32)
+
+    def sep(k0, k1):
+        out = ndimage.convolve1d(img, k0, axis=0, mode='reflect')
+        out = ndimage.convolve1d(out, k1, axis=1, mode='reflect')
+        return out
+
+    return {
+        'raw': img,
+        'haar_ll': sep(low, low),
+        'haar_lh': np.abs(sep(low, high)), # the abs gets rid of the directionality and moreso makes an energy map
+        'haar_hl': np.abs(sep(high, low)),
+        'haar_hh': np.abs(sep(high, high)),
+    }
+
+
+# ---------- dense map engine ----------
+
+def _feature_dict_for_patch(
+    patch: np.ndarray,
+    patch_q: np.ndarray,
+    families: tuple[str, ...],
+    levels: int,
+) -> dict[str, float]:
+    out = {}
+    if 'firstorder' in families:
+        out.update(_nanmean_std_percentiles(patch))
+    if 'glcm' in families:
+        out.update(glcm_features_patch(patch_q, levels=levels))
+    if 'glrlm' in families:
+        out.update(glrlm_features_patch(patch_q, levels=levels))
+    if 'glszm' in families:
+        out.update(glszm_features_patch(patch_q, levels=levels))
+    if 'gldm' in families:
+        out.update(gldm_features_patch(patch_q, levels=levels))
+    if 'ngtdm' in families:
+        out.update(ngtdm_features_patch(patch_q, levels=levels))
+    if 'lbp' in families:
+        out.update(lbp_features_patch(patch))
+    if 'gradient' in families:
+        out.update(gradient_orientation_features_patch(patch))
+    return out
+
+
+def _row_worker(
+    r: int,
+    cols: np.ndarray,
+    images: dict[str, np.ndarray],
+    quantized: dict[str, np.ndarray],
+    window: int,
+    mask: np.ndarray | None,
+    min_valid_frac: float,
+    families: tuple[str, ...],
+    levels: int,
+) -> list[tuple[int, dict[str, float]]]:
+    rad = window // 2
+    row_results = []
+    for c in cols:
+        r0, r1 = r - rad, r + rad + 1
+        c0, c1 = c - rad, c + rad + 1
+        patch_mask = None if mask is None else mask[r0:r1, c0:c1]
+        if patch_mask is not None and patch_mask.mean() < min_valid_frac:
+            row_results.append((c, {}))
+            continue
+        feats = {}
+        for band_name, image in images.items():
+            patch = image[r0:r1, c0:c1]
+            patch_q = quantized[band_name][r0:r1, c0:c1]
+            patch_feats = _feature_dict_for_patch(patch, patch_q, families=families, levels=levels)
+            for k, v in patch_feats.items():
+                feats[f'{band_name}__{k}'] = v
+        row_results.append((c, feats))
+    return row_results
+
+
+def compute_dense_texture_maps(
+    image: np.ndarray,
+    window: int = 31,
+    step: int = 2,
+    mask: np.ndarray | None = None,
+    families: tuple[str, ...] = ('firstorder', 'glcm', 'glrlm', 'glszm', 'gldm', 'ngtdm', 'lbp', 'gradient'),
+    include_wavelet: bool = True,
+    levels: int = 32,
+    min_valid_frac: float = 0.5,
+    n_jobs: int = 1,
+) -> tuple[dict[str, np.ndarray], DenseMapMeta]:
+    """
+    Generic dense texture engine.
+
+    Output maps live on the sampled grid. Use step=1 or 2 for dense maps, larger step for fast previews.
+    """
+    img = image.astype(np.float32)
+    if img.ndim != 2:
+        raise ValueError('compute_dense_texture_maps expects one 2D image')
+    if window % 2 == 0:
+        raise ValueError('window must be odd')
+
+    bands = haar_like_bands(img) if include_wavelet else {'raw': img}
+    quantized = {name: robust_rescale_uint(arr, levels=levels) for name, arr in bands.items()}
+
+    rad = window // 2
+    rows = np.arange(rad, img.shape[0] - rad, step)
+    cols = np.arange(rad, img.shape[1] - rad, step)
+    if len(rows) == 0 or len(cols) == 0:
+        raise ValueError('window too large for image')
+
+    worker = delayed(_row_worker)
+    results = Parallel(n_jobs=n_jobs, prefer='processes')(
+        worker(r, cols, bands, quantized, window, mask, min_valid_frac, families, levels)
+        for r in rows
+    )
+
+    feature_names = set()
+    for row in results:
+        for _, feats in row:
+            feature_names.update(feats)
+    maps = {name: np.full((len(rows), len(cols)), np.nan, dtype=np.float32) for name in sorted(feature_names)}
+
+    for i, row in enumerate(results):
+        for j, (_, feats) in enumerate(row):
+            for name, value in feats.items():
+                maps[name][i, j] = value
+
+    meta = DenseMapMeta(
+        row_centers=rows,
+        col_centers=cols,
+        window=window,
+        step=step,
+        image_shape=img.shape,
+    )
+    return maps, meta
+
+
+def resample_map_to_image(feature_map: np.ndarray, meta: DenseMapMeta, order: int = 1) -> np.ndarray:
+    """Resize a sampled-grid map back to image size for quick visualization."""
+    return resize(feature_map, meta.image_shape, order=order, preserve_range=True, anti_aliasing=False).astype(np.float32)
+
+
+# ---------- B-scan -> en-face ----------
+
+def _project_one_bscan(
+    z: int,
+    bscan: np.ndarray,
+    upper: np.ndarray,
+    lower: np.ndarray,
+    window: int,
+    step: int,
+    pad: int,
+    families: tuple[str, ...],
+    include_wavelet: bool,
+    levels: int,
+    feature_post_radius: int,
+) -> tuple[int, dict[str, np.ndarray]]:
+    y_min = int(np.floor(np.minimum(upper, lower).min() - pad - window))
+    y_max = int(np.ceil(np.maximum(upper, lower).max() + pad + window))
+    y_min = max(0, y_min)
+    y_max = min(bscan.shape[0], y_max)
+    crop = bscan[y_min:y_max]
+
+    maps, meta = compute_dense_texture_maps(
+        crop,
+        window=window,
+        step=step,
+        mask=None,
+        families=families,
+        include_wavelet=include_wavelet,
+        levels=levels,
+        n_jobs=1,
+    )
+
+    # Nonsense!
+    # shadow_mask = estimate_shadow_mask_from_bscan(crop)
+    # shadow_grid = shadow_mask[np.ix_(meta.row_centers, meta.col_centers)]
+    # maps = postprocess_feature_dict(maps, vessel_mask=shadow_grid, radius=feature_post_radius)
+
+    y_grid = meta.row_centers + y_min
+    x_grid = meta.col_centers
+    vecs = {}
+    for name, fmap in maps.items():
+        sampled = np.full(len(x_grid), np.nan, dtype=np.float32)
+        for j, x in enumerate(x_grid):
+            lo = min(upper[x], lower[x]) - pad
+            hi = max(upper[x], lower[x]) + pad
+            keep = (y_grid >= lo) & (y_grid <= hi)
+            if keep.any():
+                sampled[j] = np.nanmean(fmap[keep, j]) # This is very opnioninaed taking the mean only
+        full = np.full(bscan.shape[1], np.nan, dtype=np.float32)
+        good = np.isfinite(sampled)
+        if good.sum() >= 2:
+            full[:] = np.interp(np.arange(bscan.shape[1]), x_grid[good], sampled[good])
+        vecs[name] = full
+    return z, vecs
+
+
+def project_bscan_texture_to_enface(
+    volume: np.ndarray,
+    upper_bound: np.ndarray,
+    lower_bound: np.ndarray,
+    z_step: int = 1,
+    window: int = 31,
+    step: int = 4,
+    pad: int = 10,
+    families: tuple[str, ...] = ('firstorder', 'glcm', 'glrlm', 'glszm', 'gldm', 'ngtdm', 'lbp', 'gradient'),
+    include_wavelet: bool = False,
+    levels: int = 32,
+    feature_post_radius: int = 3,
+    n_jobs: int = 1,
+) -> dict[str, np.ndarray]:
+    """
+    Compute texture in each B-scan, then collapse vertically inside the ROI to build en-face feature maps.
+
+    upper_bound and lower_bound should be (Z, X) arrays.
+    """
+    vol = np.asarray(volume)
+    if vol.ndim != 3:
+        raise ValueError('volume must be (Z, Y, X)')
+    z_idx = np.arange(0, vol.shape[0], z_step)
+    worker = delayed(_project_one_bscan)
+    out = Parallel(n_jobs=n_jobs, prefer='processes')(
+        worker(
+            int(z),
+            vol[z].astype(np.float32),
+            upper_bound[z].astype(np.float32),
+            lower_bound[z].astype(np.float32),
+            window,
+            step,
+            pad,
+            families,
+            include_wavelet,
+            levels,
+            feature_post_radius,
+        )
+        for z in z_idx
+    )
+
+    feature_names = sorted({k for _, d in out for k in d})
+    enface = {name: np.full((vol.shape[0], vol.shape[2]), np.nan, dtype=np.float32) for name in feature_names}
+    for z, vecs in out:
+        for name, vec in vecs.items():
+            enface[name][z] = vec
+
+    if z_step > 1:
+        filled = {}
+        src_z = z_idx.astype(float)
+        full_z = np.arange(vol.shape[0], dtype=float)
+        for name, arr in enface.items():
+            out_arr = arr.copy()
+            for x in range(arr.shape[1]):
+                good = np.isfinite(arr[z_idx, x])
+                if good.sum() >= 2:
+                    out_arr[:, x] = np.interp(full_z, src_z[good], arr[z_idx[good], x])
+            filled[name] = out_arr
+        enface = filled
+    return enface
+
+
+
+def slab_average_to_enface(
+    volume: np.ndarray,
+    upper_bound: np.ndarray,
+    lower_bound: np.ndarray,
+    pad: int = 5,
+    statistic: str = 'mean',
+) -> np.ndarray:
+    """Collapse each B-scan slab directly into an en-face image before any texture computation."""
+    stat_fn = np.nanmean if statistic == 'mean' else np.nanmedian
+    vol = np.asarray(volume)
+    out = np.full((vol.shape[0], vol.shape[2]), np.nan, dtype=np.float32)
+    for z in range(vol.shape[0]):
+        for x in range(vol.shape[2]):
+            lo = max(0, int(np.floor(min(upper_bound[z, x], lower_bound[z, x]) - pad)))
+            hi = min(vol.shape[1], int(np.ceil(max(upper_bound[z, x], lower_bound[z, x]) + pad)) + 1)
+            if hi > lo:
+                out[z, x] = float(stat_fn(vol[z, lo:hi, x]))
+    return out
