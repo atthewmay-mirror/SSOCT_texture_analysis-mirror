@@ -932,6 +932,9 @@ def od_os_asymmetry(
     )
 ###################
 
+def dummy_fn():
+    print('this is a dumb function')
+    print('concur')
 
     
 GLOBAL_RECOMPUTE = True
@@ -951,4 +954,5 @@ if __name__ == '__main__':
     for k in all_map_keys:
         if GLOBAL_RECOMPUTE or k not in ALL_EXISTING_MAPS:
             plot_maps(maps_dict,k)
+
 
