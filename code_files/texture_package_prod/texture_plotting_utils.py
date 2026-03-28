@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import pdb
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -103,33 +104,75 @@ def plot_alignment_preview(left: np.ndarray, right: np.ndarray, out_path: str | 
 
 
 
+# def plot_texture_zarr_feature_grid(
+#     zarr_root,
+#     features=('raw__mean', 'raw__std', 'raw__glcm_contrast'),
+#     n_slices=5,
+#     save_tag="",
+#     max_per_array_board = 60
+# ):
+#     import zarr
+
+#     features = [f for f in features if f in zarr_root]
+
+#     if not features:
+#         raise ValueError('None of the requested features were found in the zarr.')
+#     print(list(zarr_root.keys()))
+#     print(f"all the features to be plotted are {features}")
+
+#     Z = zarr_root[features[0]].shape[0]
+#     z_indices = np.linspace(0, Z - 1, n_slices).round().astype(int)
+#     z_indices = np.unique(z_indices)
+
+
+#     for z in z_indices:
+#         AB = ArrayBoard(plt_display=False, return_fig=True, ncols_max=len(features), save_tag=save_tag+"_slice_{i}")
+#         for feat in features:
+#             AB.add(zarr_root[feat][int(z), :, :], title=f'{feat} | z={int(z)}')
+
+#         fig = AB.render()
+#     return fig
+
 def plot_texture_zarr_feature_grid(
-    zarr_path,
-    features=('raw__mean', 'raw__std', 'raw__glcm_contrast'),
-    n_slices=5,
-    save_path=None,
-):
-    import zarr
-    root = zarr.open_group(str(zarr_path), mode='r')
+        zarr_root,
+        features=('raw__mean', 'raw__std', 'raw__glcm_contrast'),
+        n_slices=5,
+        save_tag="",
+        max_per_array_board=60,
+    ):
+    import numpy as np
 
-    features = [f for f in features if f in root]
-
+    features = [f for f in features if f in zarr_root]
     if not features:
         raise ValueError('None of the requested features were found in the zarr.')
-    print(list(root.keys()))
+
+    print(list(zarr_root.keys()))
     print(f"all the features to be plotted are {features}")
 
-    Z = root[features[0]].shape[0]
+    Z = zarr_root[features[0]].shape[0]
     z_indices = np.linspace(0, Z - 1, n_slices).round().astype(int)
     z_indices = np.unique(z_indices)
 
-    AB = ArrayBoard(plt_display=False, return_fig=True, ncols_max=len(features), save_tag='texture_zarr_grid')
+    figs = []
 
     for z in z_indices:
-        for feat in features:
-            AB.add(root[feat][int(z), :, :], title=f'{feat} | z={int(z)}')
+        for start in range(0, len(features), max_per_array_board):
+            feat_chunk = features[start:start + max_per_array_board]
 
-    fig = AB.render(suptitle=f'{Path(zarr_path).name}')
-    if save_path is not None:
-        fig.savefig(save_path, bbox_inches='tight')
-    return fig
+            AB = ArrayBoard(
+                plt_display=False,
+                return_fig=True,
+                ncols_max=min(len(feat_chunk), 6),
+                save_tag=f"{save_tag}_z{int(z):03d}_part{start // max_per_array_board:02d}",
+            )
+
+            for feat in feat_chunk:
+                AB.add(
+                    zarr_root[feat][int(z), :, :],
+                    title=f'{feat} | z={int(z)}',
+                )
+
+            fig = AB.render()
+            figs.append(fig)
+
+    return figs

@@ -542,3 +542,34 @@ def load_training_df(
         raise ValueError(f"Missing required column: {split_col}")
 
     return df.loc[df[split_col] == "train"].copy()
+
+def vol_string_to_layer_output():
+    """pull the layer name from the excel of integer ID and """
+
+
+def load_algorithm_key_lookup(excel_path):
+    import pandas as pd
+    df = pd.read_excel(excel_path)
+
+    algo_to_key = {
+        'EZ': 'EZ_method_y2_vertical_shifted',
+        'Choroidal': 'choroidal_method_y1_vertical_shifted',
+        'Original': 'original_method_y2_vertical_shifted',
+    }
+
+    lookup = {}
+    for _, row in df.iterrows():
+        key = (int(row['Integer ID']), str(row['Laterality']).strip().upper())
+        lookup[key] = algo_to_key[str(row['Algorithm Type']).strip()]
+
+    return lookup
+
+
+def get_algorithm_key_from_filepath(filepath):
+    lookup = load_algorithm_key_lookup("/Users/matthewhunt/Research/Iowa_Research/Han_AIR/data/ID_and_laterality_to_algo_type.xlsx")
+    s = str(Path(filepath).name)
+
+    integer_id = int(re.search(r'(\d+)_Cube', s).group(1))
+    laterality = re.search(r'(OD|OS)', s).group(1).upper()
+    key = (integer_id, laterality)
+    return lookup[key]
