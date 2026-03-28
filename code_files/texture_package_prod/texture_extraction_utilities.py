@@ -280,6 +280,27 @@ def haar_like_bands(image: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
+def retinal_thickness_map(
+    upper_bound: np.ndarray,
+    lower_bound: np.ndarray,
+    abs_value: bool = True,
+) -> np.ndarray:
+    """
+    Return a (Z, X) thickness map from two surfaces.
+    For current use this is usually ilm_smooth minus the algorithm-selected RPE-family line.
+    """
+    upper = np.asarray(upper_bound, dtype=np.float32)
+    lower = np.asarray(lower_bound, dtype=np.float32)
+
+    if upper.shape != lower.shape:
+        raise ValueError('upper_bound and lower_bound must have the same shape')
+
+    out = upper - lower
+    if abs_value:
+        out = np.abs(out)
+    return out.astype(np.float32, copy=False)
+
+
 # ---------- dense map engine ----------
 
 def _feature_dict_for_patch(
@@ -706,6 +727,7 @@ def project_bscan_texture_to_enface(
     n_jobs: int = 1,
 ) -> dict[str, np.ndarray]:
     """
+    likely not going to be used -- we will instead have the bscan texture zarrs and use some of the below functions.
     Compute texture in each B-scan, then collapse vertically inside the ROI to build en-face feature maps.
 
     upper_bound and lower_bound should be (Z, X) arrays.
@@ -752,6 +774,129 @@ def project_bscan_texture_to_enface(
         enface = filled
     return enface
 
+class TextureSlabProjector:
+    def __init__(
+        self,
+        texture_vol,
+        reference_line,
+        max_top_offset,
+        max_bottom_offset,
+        extra_pad=0,
+    ):
+        import numpy as np
+
+        ref = np.asarray(reference_line, dtype=np.float32)   # (Z, X)
+
+        top = np.floor(ref - max_top_offset).astype(np.int32)
+        bottom = np.ceil(ref - max_bottom_offset).astype(np.int32)
+
+        y_min = int(np.nanmin(np.minimum(top, bottom))) - extra_pad
+        y_max = int(np.nanmax(np.maximum(top, bottom))) + extra_pad
+
+        full_Y = texture_vol.shape[1]
+        y_min = max(0, y_min)
+        y_max = min(full_Y - 1, y_max)
+
+        arr = np.asarray(texture_vol[:, y_min:y_max + 1, :], dtype=np.float32)
+        self.y0 = y_min
+        self.Z, self.Y, self.X = arr.shape
+
+        valid = np.isfinite(arr)
+        vals = np.where(valid, arr, 0.0)
+
+        vals_yzx = np.transpose(vals, (1, 0, 2))
+        cnts_yzx = np.transpose(valid.astype(np.int32), (1, 0, 2))
+
+        self.csum = np.empty((self.Y + 1, self.Z, self.X), dtype=np.float32)
+        self.ccnt = np.empty((self.Y + 1, self.Z, self.X), dtype=np.int32)
+
+        self.csum[0] = 0
+        self.ccnt[0] = 0
+        np.cumsum(vals_yzx, axis=0, out=self.csum[1:])
+        np.cumsum(cnts_yzx, axis=0, out=self.ccnt[1:])
+
+    def project_between(self, upper_bound, lower_bound, interp_x=True):
+        import numpy as np
+
+        top = np.floor(np.minimum(upper_bound, lower_bound)).astype(np.int32)
+        bottom = np.ceil(np.maximum(upper_bound, lower_bound)).astype(np.int32)
+
+        # move from full-image Y coords into cropped coords
+        top = top - self.y0
+        bottom = bottom - self.y0
+
+        # example here: exclude the boundary rows themselves
+        start = top + 1
+        stop = bottom
+
+        start = np.clip(start, 0, self.Y)
+        stop = np.clip(stop, 0, self.Y)
+
+        z_idx = np.arange(self.Z)[:, None]
+        x_idx = np.arange(self.X)[None, :]
+
+        sums = self.csum[stop, z_idx, x_idx] - self.csum[start, z_idx, x_idx]
+        cnts = self.ccnt[stop, z_idx, x_idx] - self.ccnt[start, z_idx, x_idx]
+
+        out = np.full((self.Z, self.X), np.nan, dtype=np.float32)
+        good = cnts > 0
+        out[good] = sums[good] / cnts[good]
+
+        if interp_x:
+            for z in range(self.Z):
+                g = np.isfinite(out[z])
+                if g.sum() >= 2:
+                    out[z] = np.interp(np.arange(self.X), np.where(g)[0], out[z, g])
+
+        return out
+
+def project_texture_zarr_to_enface_for_volume(
+    vol_path,
+    texture_zarr_path,
+    flat_layers_npz,
+    line_key=None,
+    candidate_slabs = [[5,15]],
+    features=None,
+    interp_x=True,
+):
+    """
+    Load a thick texture zarr and re-project a thinner slab to en-face.
+
+    candidate_slabs are [bottom_idx offset from RPE line, top index offset from RPE line (lower y value)]
+    line_key:
+      None -> use file_utils.get_algorithm_key_from_filepath(vol_path)
+      str  -> use that flattened layer key directly
+    """
+    from pathlib import Path
+    import numpy as np
+    import zarr
+    from code_files import file_utils
+
+    vol_path = Path(vol_path)
+    flat_layers = np.load(flat_layers_npz)
+
+    if line_key is None:
+        line_key = file_utils.get_algorithm_key_from_filepath(vol_path)
+
+    root = zarr.open_group(str(texture_zarr_path), mode='r')
+    center = flat_layers[line_key]
+
+    if features is None:
+        features = list(root.array_keys())
+
+    out = {}
+    for feat in features:
+        proj = TextureSlabProjector(
+                    texture_vol=root[feat],   # pass zarr-backed array, not full np.asarray
+                    reference_line=center,
+                    max_top_offset=min(t for b, t in candidate_slabs),
+                    max_bottom_offset=max(b for b, t in candidate_slabs),
+                    extra_pad=2,
+                )
+        for bottom_offset, top_offset in candidate_slabs:
+            enface = proj.project_between(center - top_offset, center - bottom_offset,interp_x=interp_x)
+            out[f"{feat}|{bottom_offset}->{top_offset}"] = enface
+    return out
 
 
 def slab_average_to_enface(
@@ -772,3 +917,21 @@ def slab_average_to_enface(
             if hi > lo:
                 out[z, x] = float(stat_fn(vol[z, lo:hi, x]))
     return out
+
+def save_enface_feature_maps_npz(
+    feature_maps: dict[str, np.ndarray],
+    out_npz_path: str | Path,
+) -> Path:
+    """
+    Save small en-face feature maps, shape (Z, X), into one NPZ.
+    """
+    out_npz_path = Path(out_npz_path)
+    out_npz_path.parent.mkdir(parents=True, exist_ok=True)
+
+    arrays = {
+        name: np.asarray(arr, dtype=np.float32)
+        for name, arr in feature_maps.items()
+    }
+    np.savez_compressed(out_npz_path, **arrays)
+    return out_npz_path
+

@@ -92,6 +92,9 @@ def parse_args():
     )
 
 
+    p.add_argument("--show_texture_overlay", action="store_true")
+    p.add_argument("--texture_zarr_root", type=str, default=None)
+    p.add_argument("--texture_features", type=str, default=None)
 
 
 
@@ -146,6 +149,9 @@ def load_one_volume(
     layers_root: str | Path,
     annotation_root: str | Path | None = None,
     flattened_artifacts_root: Path = Path('/Volumes/T9/iowa_research/Han_AIR_Dec_2025/flattened_artifacts'),
+    show_texture_overlay=False,
+    texture_zarr_root=None,
+    texture_features=None,   # None -> all
 ):
     """
     Return (img, lbl, annotation_img, name) for one volume.
@@ -197,19 +203,42 @@ def load_one_volume(
             layers_root=layers_root,
             annotation_root=annotation_root,
             flattened_artifacts_root=flattened_artifacts_root,
-            z_stride=z_stride,
+            z_stride=1,
             overwrite=overwrite,
             make_image_zarr=True,
             make_label_zarr=True,
             save_flat_layers_npz=True,
             make_annotation_zarr=True,
+            include_texture_zarr=show_texture_overlay,
+            texture_zarr_root=texture_zarr_root,
         )
+        assert np.load(artifacts['flat_meta_npz'])['z_stride'] == z_stride
 
-        img = da.from_zarr(str(artifacts["image_zarr"])+'/data')
+        img = da.from_zarr(str(artifacts["image_zarr"])+'/data')[::z_stride]
         img = img.rechunk((1, img.shape[-2], img.shape[-1]))
 
-        lbl = da.from_zarr(str(artifacts["label_zarr"])+'/data')
-        lbl = lbl.rechunk((1, lbl.shape[-2], lbl.shape[-1]))
+        g = zarr.open_group(str(artifacts["label_zarr"]), mode="r")
+        lbl = {
+            name: da.from_zarr(g[name])[::z_stride].rechunk((1, g[name].shape[-2], g[name].shape[-1]))
+            for name in g.array_keys()
+        }
+
+
+
+        texture = {}
+        if show_texture_overlay and artifacts["texture_zarr"] is not None:
+            tg = zarr.open_group(str(artifacts["texture_zarr"]), mode="r")
+
+            if texture_features is None:
+                names = list(tg.array_keys())
+            else:
+                names = [name for name in texture_features if name in tg]
+
+            texture = {
+                name: da.from_zarr(tg[name])[::z_stride].rechunk((1, tg[name].shape[-2], tg[name].shape[-1]))
+                for name in names
+            }
+
 
     annotation_img = None
     if artifacts["annotation_zarr"] is not None:
@@ -219,11 +248,16 @@ def load_one_volume(
             (1, annotation_img.shape[-2], annotation_img.shape[-1])
         )
 
-    return img, lbl, annotation_img, vp.stem,flattener_name
+    # return img, lbl, annotation, texture
+
+    return img, lbl, annotation_img,texture, vp.stem,flattener_name
 
 
 def main():
     args = parse_args()
+    texture_features = None
+    if args.texture_features:
+        texture_features = [s.strip() for s in args.texture_features.split(",") if s.strip()]
     
 
 
@@ -286,7 +320,8 @@ def main():
         from dask import array as da
         vp = ALL_VOL_PATHS[state["idx"]]
 
-        img, lbl, annotation_img, name,flattener_name = load_one_volume(
+        # Texture likely none
+        img, lbl, annotation_img, texture,name,flattener_name = load_one_volume(
                 vp,
                 view_mode=args.view_mode,
                 z_stride=args.z_stride,
@@ -294,6 +329,9 @@ def main():
                 layers_root=args.layers_root,
                 annotation_root=args.annotation_root,
                 flattened_artifacts_root=args.flattened_artifacts_root,
+                show_texture_overlay=args.show_texture_overlay,
+                texture_zarr_root=args.texture_zarr_root,
+                texture_features=texture_features,
             )
 
 
@@ -322,24 +360,36 @@ def main():
                 metadata={"src_path": str(vp)},
             )
 
-            if args.view_mode == "nonflat":
-                state["lbl_layers"] = {}
-                for set_name, arr in lbl.items():
-                    lyr = viewer.add_labels(arr, name=set_name, opacity=0.8, scale=scale)
-                    lyr.color = {0:(0,0,0,0), 1:'magenta', 2:'green', 6:'yellow', 3:'cyan', 4:'orange', 5:'blue'}
-                    lyr.color_mode = "direct"
-                    lyr.refresh()
-                    state["lbl_layers"][set_name] = lyr
-            else:
-                state["flat_lbl_layer"] = viewer.add_labels(
-                    lbl,
-                    name=f"{flattener_name}_flat_labels",
-                    opacity=0.8,
-                    scale=scale,
+            # if args.view_mode == "nonflat":
+            state["lbl_layers"] = {}
+            for set_name, arr in lbl.items():
+                lyr = viewer.add_labels(arr, name=set_name, opacity=0.8, scale=scale,visible=False)
+                lyr.color = {0:(0,0,0,0), 1:'magenta', 2:'green', 6:'yellow', 3:'cyan', 4:'orange', 5:'blue'}
+                lyr.color_mode = "direct"
+                lyr.refresh()
+                state["lbl_layers"][set_name] = lyr
+            # else:
+            #     state["flat_lbl_layer"] = viewer.add_labels(
+            #         lbl,
+            #         name=f"{flattener_name}_flat_labels",
+            #         opacity=0.8,
+            #         scale=scale,
+            #     )
+            #     state["flat_lbl_layer"].color = {0:(0,0,0,0), 1:'magenta', 2:'green', 6:'yellow', 3:'cyan', 4:'orange', 5:'blue'}
+            #     state["flat_lbl_layer"].color_mode = "direct"
+            #     state["flat_lbl_layer"].refresh()
+
+            # likely only in play for flattened one
+            for feat_name, tex_arr in texture.items():
+                viewer.add_image(
+                    tex_arr,
+                    name=f"tex:{feat_name}",
+                    visible=False,
+                    opacity=0.45,
+                    blending="additive",
+                    colormap="inferno",
+                    scale=(1, 1/3, 1),   # same as your B-scan image if that is what you use
                 )
-                state["flat_lbl_layer"].color = {0:(0,0,0,0), 1:'magenta', 2:'green', 6:'yellow', 3:'cyan', 4:'orange', 5:'blue'}
-                state["flat_lbl_layer"].color_mode = "direct"
-                state["flat_lbl_layer"].refresh()
 
             if annotation_img is not None:
                 state["annotation_layer"] = viewer.add_labels(

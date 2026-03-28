@@ -114,33 +114,48 @@ def write_labels_group_to_zarr_streaming(
     """
     import zarr, numcodecs, numpy as np
 
-    compressor = numcodecs.Blosc(cname="lz4", clevel=3, shuffle=numcodecs.Blosc.BITSHUFFLE)
+    compressor = numcodecs.Blosc(
+        cname="lz4",
+        clevel=3,
+        shuffle=numcodecs.Blosc.BITSHUFFLE,
+    )
 
-    store = zarr.DirectoryStore(str(zarr_path))
-    root = zarr.open_group(store, mode="w")  # overwrite group
+    try: # handlign multiple envs
+        root = zarr.open_group(str(zarr_path), mode="w", zarr_format=2)
+        for name, v in vols.items():
+            assert v.ndim == 3, (name, v.shape)
+            Z, H, W = v.shape
+            root.create_array(
+                name=name,
+                shape=(Z, H, W),
+                chunks=chunks,
+                dtype=v.dtype,
+                compressor=compressor,
+                overwrite=True,
+                fill_value=0,
+            )
+    except TypeError:
+        root = zarr.open_group(str(zarr_path), mode="w")
+        for name, v in vols.items():
+            assert v.ndim == 3, (name, v.shape)
+            Z, H, W = v.shape
+            root.create_dataset(
+                name=name,
+                shape=(Z, H, W),
+                chunks=chunks,
+                dtype=v.dtype,
+                compressor=compressor,
+                overwrite=True,
+                fill_value=0,
+            )
 
-    # Create datasets
-    for name, v in vols.items():
-        assert v.ndim == 3, (name, v.shape)
-        Z, H, W = v.shape
-        root.create_dataset( # Weird idk why
-            name,
-            shape=(Z, H, W),
-            chunks=chunks,
-            dtype=v.dtype,
-            compressor=compressor,
-            overwrite=True,
-        )
-
-    # Stream slice-by-slice in Z (bounded RAM)
-    # (Writes one Z-chunk per dataset per k)
     any_vol = next(iter(vols.values()))
     Z = any_vol.shape[0]
     for k in range(Z):
         for name, v in vols.items():
             root[name][k, :, :] = v[k, :, :]
 
-    zarr.consolidate_metadata(store)
+    zarr.consolidate_metadata(str(zarr_path))
     return zarr_path
 
 def ensure_labels_zarr(vol_path: Path, z_stride: int,overwrite: bool,layers_root: str ) -> Path:
@@ -165,46 +180,8 @@ def ensure_labels_zarr(vol_path: Path, z_stride: int,overwrite: bool,layers_root
         layers = np.load(layer_path)                      # (Z, W, n_layers) dict-like npz or array
         layers = fu.downsample_layers(layers, (1, 1, 1))  # keep XY native for alignment
 
-        LABEL_SETS = {
-            'basics':["hypersmoother_path", "rpe_smooth", "ilm_raw", "ilm_smooth"],
-            'ILM':["ilm_raw", "ilm_smooth"],
-            'two_layer_original': [
-                # 'original_method_y1_rescaled',
-                # 'original_method_y2_rescaled',
-                'original_method_y1_vertical_shifted',
-                'original_method_y2_vertical_shifted',
-            ],
-            'two_layer_choroidal': [ 
-                # 'choroidal_method_y1_rescaled',
-                # 'choroidal_method_y2_rescaled',
-                'choroidal_method_y1_vertical_shifted',
-                'choroidal_method_y2_vertical_shifted',],
-            'two_layer_EZ': [ 
-                    # 'EZ_method_y1_rescaled',
-                    # 'EZ_method_y2_rescaled',
-                    'EZ_method_y1_vertical_shifted',
-                    'EZ_method_y2_vertical_shifted'],
-            'all_methods_RPE':[
-                'original_method_y2_vertical_shifted',
-                'choroidal_method_y1_vertical_shifted',
-                'EZ_method_y2_vertical_shifted'],
-        }
- 
- 
-        vols = {}
-        for set_name, names in LABEL_SETS.items():
-            print(f"assigning names = {names} into the label-zarr being created")
-            v = fu.curves_to_label_vol(
-                layers,
-                image_height=H,
-                vert_dilation_size=1,
-                names_to_use=names,
-            )
-            if z_stride > 1:
-                v = v[::z_stride]
-            vols[set_name] = v.astype(np.uint8, copy=False)
-            print(f"np.unique(v,return_counts=True) = {np.unique(v,return_counts=True)}")
- 
+        vols = _build_label_set_vols(layers,H,1,z_stride=z_stride)
+
         write_labels_group_to_zarr_streaming(vols, labels_zarr, chunks=(1, H, W))
 
         print(f"[build] labels → {labels_zarr}")
@@ -213,6 +190,63 @@ def ensure_labels_zarr(vol_path: Path, z_stride: int,overwrite: bool,layers_root
     return labels_zarr
 
 
+def _build_label_set_vols(layers, image_height, vert_dilation_size=1, z_stride=1):
+    LABEL_SETS = {
+        'basics': ["hypersmoother_path", "rpe_smooth", "ilm_raw", "ilm_smooth"],
+        'ILM': ["ilm_raw", "ilm_smooth"],
+        'two_layer_original': [
+            'original_method_y1_vertical_shifted',
+            'original_method_y2_vertical_shifted',
+        ],
+        'two_layer_choroidal': [
+            'choroidal_method_y1_vertical_shifted',
+            'choroidal_method_y2_vertical_shifted',
+        ],
+        'two_layer_EZ': [
+            'EZ_method_y1_vertical_shifted',
+            'EZ_method_y2_vertical_shifted',
+        ],
+        'all_methods_RPE': [
+            'original_method_y2_vertical_shifted',
+            'choroidal_method_y1_vertical_shifted',
+            'EZ_method_y2_vertical_shifted',
+        ],
+    }
+
+    class _LayerShim:
+        def __init__(self, d):
+            self._d = d
+            self.files = list(d.keys())
+
+        def __getitem__(self, key):
+            return self._d[key]
+
+    layer_shim = _LayerShim(layers)
+
+
+    vols = {}
+    for set_name, names in LABEL_SETS.items():
+        names = [n for n in names if n in layer_shim._d.keys()]
+        if not names:
+            continue
+        v = fu.curves_to_label_vol(
+            layer_shim,
+            image_height=image_height,
+            vert_dilation_size=vert_dilation_size,
+            names_to_use=names,
+        )
+        if z_stride > 1:
+            v = v[::z_stride]
+        vols[set_name] = v.astype(np.uint8, copy=False)
+    return vols
+
+
+
+def get_texture_zarr_path(vol_path: Path, texture_zarr_root: str | Path | None):
+    if texture_zarr_root is None:
+        return None
+    texture_zarr_root = Path(texture_zarr_root)
+    return texture_zarr_root / vol_path.stem / "texture_bscan_maps.zarr"
 
 
 
@@ -268,13 +302,13 @@ def _write_volume_to_zarr_streaming(vol_np: np.ndarray, zarr_path: Path, chunks:
 
 
 def _flatten_one_slice(job):
-    z, img, ref_line, lines_dict, fill = job
+    z, img, ref_line, lines_dict, fill,target_y_global = job
 
     flat_img, shift_z, target_z = flatten_to_path(
         img,
         ref_line,
         fill=fill,
-        target_y=None,
+        target_y=target_y_global,
     )
 
     flat_lines = {}
@@ -293,6 +327,7 @@ def _flatten_volume_and_layers_to_ref(
     layers: dict[str, np.ndarray],
     flatten_with: str,
     fill: float = 0.0,
+    target_y_global: int = None,
     max_workers: int=8,
 ):
     if flatten_with not in layers:
@@ -322,6 +357,7 @@ def _flatten_volume_and_layers_to_ref(
             ref[z],
             {name: layers[name][z] for name in flat_layers},
             fill,
+            target_y_global
         )
         for z in range(Z)
     ]
@@ -389,6 +425,8 @@ def ensure_flattened_artifacts(
     save_flat_layers_npz: bool = True,
     fill: float = 0.0,
     vert_dilation_size: int = 2,
+    include_texture_zarr: bool = False,
+    texture_zarr_root: str | Path | None = None,
 ):
     """
     Build/reuse reversible flattened artifacts for one volume.
@@ -400,6 +438,9 @@ def ensure_flattened_artifacts(
       *.{flatten_with}.flat_meta.npz
 
     flat_meta.npz contains the actual warp info needed for unflattening later.
+
+    What is a little messy is that this has several passthroughs. the function itself exists to both 1. enforce flattening of the flatten-requiring structure (img andlayers, along w/ creating the flat layer-labels vol), 
+    and 2. organize the artifacts into single API. Thus there are passthroughs for annotations and textures. Fine for now. 
     """
     vol_path = Path(vol_path)
     vol_name = vol_path.stem
@@ -411,7 +452,7 @@ def ensure_flattened_artifacts(
     flat_meta_npz = (flattened_artifacts_root/vol_name).with_suffix(f".{flatten_with}.flat_meta.npz")
 
     annotation_zarr = None
-    if make_annotation_zarr:
+    if make_annotation_zarr and annotation_root is not None:
         annotation_path = Path(annotation_root) / vol_path.with_suffix(".labels.zarr").name
         if annotation_path.exists():
             annotation_zarr = ensure_image_zarr(
@@ -422,6 +463,13 @@ def ensure_flattened_artifacts(
         else:
             print(f"[info] annotation file not found for {vol_path.name}: {annotation_path}")
 
+    texture_zarr = None
+    if include_texture_zarr:
+        cand = get_texture_zarr_path(vol_path, texture_zarr_root)
+        if cand is not None and cand.exists():
+            texture_zarr = cand
+        else:
+            print(f"[info] texture zarr not found for {vol_path.name}: {cand}")
 
 
     need_build = overwrite or any(
@@ -433,16 +481,20 @@ def ensure_flattened_artifacts(
     )
 
     if not need_build:
-        print(f"[reuse] flattened artifacts for {vol_path.name} using {flatten_with}. asserting z_stride aligns.")
+        print(f"[reuse] flattened artifacts for {vol_path.name} using {flatten_with}. not asserting z_stride aligns.")
 
-        assert np.load(flat_meta_npz)['z_stride'] == z_stride
+        # assert np.load(flat_meta_npz)['z_stride'] == z_stride
+
         return {
             "image_zarr": img_zarr if make_image_zarr else None,
             "label_zarr": lbl_zarr if make_label_zarr else None,
-            "annotation_zarr":annotation_zarr,
+            "annotation_zarr": annotation_zarr,
+            "texture_zarr": texture_zarr,
             "flat_layers_npz": flat_layers_npz if save_flat_layers_npz else None,
             "flat_meta_npz": flat_meta_npz,
         }
+
+
 
     print(f"[building] flattened artifacts for {vol_path.name} using {flatten_with}. asserting z_stride aligns.")
     layer_path = fu.new_get_corresponding_layer_path(vol_path, layers_root=layers_root)
@@ -459,6 +511,7 @@ def ensure_flattened_artifacts(
         layers=layers,
         flatten_with=flatten_with,
         fill=fill,
+        target_y_global=H//2,
     )
 
     if z_stride > 1:
@@ -478,18 +531,13 @@ def ensure_flattened_artifacts(
         print(f"[build] image(flat:{flatten_with}) -> {img_zarr}")
 
     if make_label_zarr:
-        lbl_flat = _paint_labels_from_flat_layers(
+        vols = _build_label_set_vols(
             flat_layers,
             image_height=H,
             vert_dilation_size=vert_dilation_size,
+            z_stride=1,
         )
-        _write_volume_to_zarr_streaming(
-            lbl_flat.astype(np.uint8, copy=False),
-            lbl_zarr,
-            chunks=(1, H, W),
-            overwrite=True,
-        )
-        print(f"[build] labels(flat:{flatten_with}) -> {lbl_zarr}")
+        write_labels_group_to_zarr_streaming(vols, lbl_zarr, chunks=(1, H, W))
 
     if save_flat_layers_npz:
         np.savez_compressed(flat_layers_npz, **flat_layers)
@@ -505,10 +553,12 @@ def ensure_flattened_artifacts(
     )
     print(f"[build] flat meta -> {flat_meta_npz}")
 
+
     return {
         "image_zarr": img_zarr if make_image_zarr else None,
         "label_zarr": lbl_zarr if make_label_zarr else None,
-        "annotation_zarr": None,
+        "annotation_zarr": annotation_zarr,
+        "texture_zarr": texture_zarr,
         "flat_layers_npz": flat_layers_npz if save_flat_layers_npz else None,
         "flat_meta_npz": flat_meta_npz,
     }
@@ -551,6 +601,7 @@ def ensure_nonflat_artifacts(
         "image_zarr": None,
         "label_zarr": None,
         "annotation_zarr": None,
+        "texture_zarr": None,
     }
 
     if make_image_zarr:

@@ -21,6 +21,8 @@ from texture_package_prod.texture_extraction_utilities import (
     project_bscan_texture_to_enface,
     resample_map_to_image,
     compute_bscan_texture_volumes_to_zarr,
+    retinal_thickness_map,
+    save_enface_feature_maps_to_zarr,
 )
 # from texture_package_prod.vessel_texture_postproc_utils import estimate_vessel_mask_from_enface, postprocess_feature_dict
 
@@ -59,6 +61,19 @@ def _load_bounds(args):
     #     raise ValueError(f'Could not find {args.upper_key}/{args.lower_key} in {args.layers_root}')
     # return layers[args.upper_key], layers[args.lower_key]
     return upper,lower
+
+def compute_extra_enface_feature_maps(args, layers):
+    """
+    Non-texture features that still belong in the same downstream feature stack.
+    """
+    rpe_key = file_utils.get_algorithm_key_from_filepath(args.input)
+
+    ilm = layers['ilm_smooth']
+    rpe = layers[rpe_key]
+
+    return {
+        'geometry__retinal_thickness': retinal_thickness_map(ilm, rpe),
+    }
 
 
 def run_oct(args):
@@ -117,7 +132,7 @@ def run_oct_to_zarr(args):
     algo_key = file_utils.get_algorithm_key_from_filepath(args.input)
     lower = layers[algo_key] + args.rpe_offset
     # upper = layers['ilm_smooth']
-    upper = lower+args.slab_thickness
+    upper = lower-args.slab_thickness
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -150,6 +165,8 @@ def run_oct_to_zarr(args):
     with open(out_dir / 'zarr_path.txt', 'w') as f:
         f.write(str(zarr_path) + '\n')
 
+
+
 def make_argparser():
     p = argparse.ArgumentParser(description='Readable texture-analysis entry point.')
     p.add_argument('--mode', choices=['fundus', 'oct'], required=True)
@@ -169,8 +186,8 @@ def make_argparser():
     p.add_argument('--overwrite', action='store_true')
     
 
-    p.add_argument('--rpe_offset', type=int, default=5)
-    p.add_argument('--slab_thickness', type=int, default=10)
+    p.add_argument('--rpe_offset', type=int, default=10)
+    p.add_argument('--slab_thickness', type=int, default=50)
 
     p.add_argument('--layers-root', type=str, default=None)
     p.add_argument('--upper-key', type=str, default='ilm_smooth')
