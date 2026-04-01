@@ -547,10 +547,10 @@ def vol_string_to_layer_output():
     """pull the layer name from the excel of integer ID and """
 
 
-def load_algorithm_key_lookup(excel_path):
+def load_algorithm_key_lookup(path):
     import pandas as pd
 
-    # path = Path(path)
+    path = Path(path)
     if path.suffix.lower() == ".csv":
         df = pd.read_csv(path)
     elif path.suffix.lower() in {".xlsx", ".xls"}:
