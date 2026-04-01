@@ -242,11 +242,67 @@ def _build_label_set_vols(layers, image_height, vert_dilation_size=1, z_stride=1
 
 
 
-def get_texture_zarr_path(vol_path: Path, texture_zarr_root: str | Path | None):
+# def get_texture_zarr_path(vol_path: Path, texture_zarr_root: str | Path | None):
+#     if texture_zarr_root is None:
+#         return None
+#     texture_zarr_root = Path(texture_zarr_root)
+#     return texture_zarr_root / vol_path.stem / "texture_bscan_maps.zarr"
+
+
+# from pathlib import Path
+
+
+def list_texture_run_dirs(vol_path: Path, texture_zarr_root: str | Path | None):
+    if texture_zarr_root is None:
+        return []
+
+    base = Path(texture_zarr_root) / vol_path.stem
+    if not base.exists():
+        return []
+
+    run_dirs = []
+    for p in sorted(base.iterdir()):
+        if not p.is_dir():
+            continue
+        if (p / "texture_bscan_maps.zarr").exists():
+            run_dirs.append(p)
+
+    return run_dirs
+
+
+def get_texture_zarr_path(
+    vol_path: Path,
+    texture_zarr_root: str | Path | None,
+    texture_run: str | None = None,
+):
     if texture_zarr_root is None:
         return None
-    texture_zarr_root = Path(texture_zarr_root)
-    return texture_zarr_root / vol_path.stem / "texture_bscan_maps.zarr"
+
+    base = Path(texture_zarr_root) / vol_path.stem
+
+    # legacy non-sweep layout
+    legacy = base / "texture_bscan_maps.zarr"
+    if legacy.exists():
+        return legacy
+
+    # explicit run requested
+    if texture_run is not None:
+        p = base / texture_run / "texture_bscan_maps.zarr"
+        return p if p.exists() else None
+
+    # auto-resolve only if exactly one run exists
+    run_dirs = list_texture_run_dirs(vol_path, texture_zarr_root)
+    if len(run_dirs) == 1:
+        return run_dirs[0] / "texture_bscan_maps.zarr"
+
+    if len(run_dirs) == 0:
+        return None
+
+    raise ValueError(
+        f"Multiple texture runs found for {vol_path.stem}: "
+        f"{[p.name for p in run_dirs]}. "
+        f"Pass texture_run=..."
+    )
 
 
 

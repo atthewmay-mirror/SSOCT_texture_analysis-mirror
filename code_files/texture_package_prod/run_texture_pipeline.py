@@ -27,6 +27,7 @@ from texture_package_prod.texture_regions import make_etdrs_grid_plus_rings, sum
 # )
 
 from texture_package_prod.texture_extraction_utilities import (
+    TextureSweepParams,
     compute_dense_texture_maps,
     project_bscan_texture_to_enface,
     resample_map_to_image,
@@ -35,7 +36,6 @@ from texture_package_prod.texture_extraction_utilities import (
     instantiate_fullsize_texture_volumes_from_compact,
     project_texture_compact_npz_to_enface_for_volume,
     retinal_thickness_map,
-    # save_enface_feature_maps_npz,
 )
 
 # from texture_package_prod.vessel_texture_postproc_utils import estimate_vessel_mask_from_enface, postprocess_feature_dict
@@ -111,6 +111,11 @@ def compute_extra_enface_feature_maps(args, layers):
         'geometry__retinal_thickness': retinal_thickness_map(ilm, rpe),
     }
 
+
+def _parse_features_to_keep(text: str | None):
+    if text is None or text.strip() == "":
+        return None
+    return tuple(x.strip() for x in text.split(",") if x.strip())
 
 def run_oct(args):
     if args.demo_oct:
@@ -201,11 +206,109 @@ def run_oct(args):
 #     with open(out_dir / 'zarr_path.txt', 'w') as f:
 #         f.write(str(zarr_path) + '\n')
 
-def run_oct_to_zarr(args):
+# def run_oct_to_zarr(args):
+#     import zarr
+
+#     t1 = time.time()
+#     print(f'flattening here')
+#     art = zfu.ensure_flattened_artifacts(
+#         vol_path=Path(args.input),
+#         flatten_with=file_utils.get_algorithm_key_from_filepath(args.input),
+#         layers_root=args.layers_root,
+#         z_stride=args.z_step,
+#         overwrite=args.overwrite,
+#         make_image_zarr=True,
+#         make_label_zarr=True,
+#         save_flat_layers_npz=True,
+#     )
+#     print(f"we have completed the flattening: {time.time()-t1} time")
+
+#     layers = np.load(art['flat_layers_npz'])
+#     algo_key = file_utils.get_algorithm_key_from_filepath(args.input)
+#     lower = layers[algo_key] + args.rpe_offset
+#     upper = lower - args.slab_thickness
+
+#     out_dir = Path(args.out_dir)
+#     out_dir.mkdir(parents=True, exist_ok=True)
+#     volume_out_dir = out_dir / Path(args.input).stem
+#     volume_out_dir.mkdir(parents=True, exist_ok=True)
+
+#     root = zarr.open_group(str(art["image_zarr"]), mode="r")
+#     volume = root["data"]
+
+#     sweep_params = _build_texture_sweep_params(args)
+#     manifest = []
+
+#     for texture_params in sweep_params.iter_cases():
+#         texture_params = texture_params.concrete()
+#         run_tag = texture_params.tag()
+#         run_dir = volume_out_dir / run_tag
+#         run_dir.mkdir(parents=True, exist_ok=True)
+
+#         zarr_path = run_dir / 'texture_bscan_maps.zarr'
+
+#         t1 = time.time()
+#         print(f"now computing textures for {run_tag}")
+
+#         compute_bscan_texture_volumes_to_zarr(
+#             volume=volume,
+#             upper_bound=upper,
+#             lower_bound=lower,
+#             out_zarr_path=zarr_path,
+#             z_step=1,
+#             step=args.step,
+#             pad=args.pad,
+#             families=DEFAULT_FAMILIES,
+#             include_wavelet=not args.no_wavelet,
+#             texture_params=texture_params,
+#             features_to_keep=None,
+#             n_jobs=args.n_jobs,
+#             single_bscan_n_jobs=args.single_bscan_n_jobs,
+#             overwrite=args.overwrite,
+#         )
+
+#         print(f"we have completed the textures for {run_tag}: {time.time()-t1} time")
+
+#         with open(run_dir / 'texture_params.json', 'w') as f:
+#             json.dump(texture_params.as_attrs(), f, indent=2)
+
+#         # manifest.append({
+#         #     'tag': run_tag,
+#         #     'zarr_path': str(zarr_path),
+#         #     **texture_params.as_attrs(),
+#         # })
+
+#         manifest.append({
+#                 'tag': run_tag,
+#                 'zarr_path': str(zarr_path),
+#                 'flat_image_zarr': str(art["image_zarr"]),
+#                 'flat_layers_npz': str(art["flat_layers_npz"]),
+#                 'input_volume': str(args.input),
+#                 'texture_params': texture_params.as_attrs(),
+#                 'rpe_offset': int(args.rpe_offset),
+#                 'slab_thickness': int(args.slab_thickness),
+#                 'pad': int(args.pad),
+#                 'step': int(args.step),
+#             })
+
+#     with open(volume_out_dir / 'texture_runs_manifest.json', 'w') as f:
+#         json.dump(manifest, f, indent=2)
+
+#     with open(volume_out_dir / 'zarr_paths.txt', 'w') as f:
+#         for row in manifest:
+#             f.write(f"{row['tag']}\t{row['zarr_path']}\n")
+
+#     if len(manifest) == 1:
+#         with open(volume_out_dir / 'zarr_path.txt', 'w') as f:
+#             f.write(str(manifest[0]['zarr_path']) + '\n')
+
+
+
+def run_oct_texture_pipeline(args):
     import zarr
 
     t1 = time.time()
-    print(f'flattening here')
+    print('flattening here')
     art = zfu.ensure_flattened_artifacts(
         vol_path=Path(args.input),
         flatten_with=file_utils.get_algorithm_key_from_filepath(args.input),
@@ -223,58 +326,111 @@ def run_oct_to_zarr(args):
     lower = layers[algo_key] + args.rpe_offset
     upper = lower - args.slab_thickness
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    volume_out_dir = out_dir / Path(args.input).stem
+    volume_out_dir = Path(args.out_dir) / Path(args.input).stem
     volume_out_dir.mkdir(parents=True, exist_ok=True)
 
     root = zarr.open_group(str(art["image_zarr"]), mode="r")
     volume = root["data"]
 
     sweep_params = _build_texture_sweep_params(args)
+    all_cases = [tp.concrete() for tp in sweep_params.iter_cases()]
     manifest = []
 
-    for texture_params in sweep_params.iter_cases():
-        texture_params = texture_params.concrete()
+    features_to_keep = _parse_features_to_keep(args.features_to_keep)
+
+    if args.materialize_full_output is not None and len(all_cases) > 1:
+        raise ValueError(
+            "materialize_full_output is currently only supported for a single texture sweep case"
+        )
+
+    for texture_params in all_cases:
         run_tag = texture_params.tag()
         run_dir = volume_out_dir / run_tag
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        zarr_path = run_dir / 'texture_bscan_maps.zarr'
-
         t1 = time.time()
         print(f"now computing textures for {run_tag}")
 
-        compute_bscan_texture_volumes_to_zarr(
-            volume=volume,
-            upper_bound=upper,
-            lower_bound=lower,
-            out_zarr_path=zarr_path,
-            z_step=1,
-            step=args.step,
-            pad=args.pad,
-            families=DEFAULT_FAMILIES,
-            include_wavelet=not args.no_wavelet,
-            texture_params=texture_params,
-            features_to_keep=None,
-            n_jobs=args.n_jobs,
-            single_bscan_n_jobs=args.single_bscan_n_jobs,
-            overwrite=args.overwrite,
-        )
+        if args.texture_output_format == 'compact_npz':
+            compact_npz_path = run_dir / 'texture_bscan_maps_compact.npz'
 
-        print(f"we have completed the textures for {run_tag}: {time.time()-t1} time")
+            compute_bscan_texture_volumes_to_compact_npz(
+                volume=volume,
+                upper_bound=upper,
+                lower_bound=lower,
+                out_npz_path=compact_npz_path,
+                z_step=1,
+                step=args.step,
+                pad=args.pad,
+                families=DEFAULT_FAMILIES,
+                include_wavelet=not args.no_wavelet,
+                texture_params=texture_params,
+                features_to_keep=features_to_keep,
+                n_jobs=args.n_jobs,
+                single_bscan_n_jobs=args.single_bscan_n_jobs,
+            )
 
-        with open(run_dir / 'texture_params.json', 'w') as f:
-            json.dump(texture_params.as_attrs(), f, indent=2)
+            print(f"we have completed the compact textures for {run_tag}: {time.time()-t1} time")
 
-        # manifest.append({
-        #     'tag': run_tag,
-        #     'zarr_path': str(zarr_path),
-        #     **texture_params.as_attrs(),
-        # })
+            with open(run_dir / 'compact_npz_path.txt', 'w') as f:
+                f.write(str(compact_npz_path) + '\n')
 
-        manifest.append({
+            if args.materialize_full_output is not None:
+                materialize_features = _parse_features_to_keep(args.materialize_features_to_keep)
+                materialize_path = Path(args.materialize_full_output)
+                output_format = 'zarr' if materialize_path.suffix == '.zarr' else 'npz'
+
+                instantiate_fullsize_texture_volumes_from_compact(
+                    compact_npz_path=compact_npz_path,
+                    out_path=materialize_path,
+                    output_format=output_format,
+                    features_to_keep=materialize_features,
+                    overwrite=args.overwrite,
+                )
+
+            manifest.append({
                 'tag': run_tag,
+                'texture_output_format': 'compact_npz',
+                'compact_npz_path': str(compact_npz_path),
+                'flat_image_zarr': str(art["image_zarr"]),
+                'flat_layers_npz': str(art["flat_layers_npz"]),
+                'input_volume': str(args.input),
+                'texture_params': texture_params.as_attrs(),
+                'rpe_offset': int(args.rpe_offset),
+                'slab_thickness': int(args.slab_thickness),
+                'pad': int(args.pad),
+                'step': int(args.step),
+                'features_to_keep': None if features_to_keep is None else list(features_to_keep),
+            })
+
+        elif args.texture_output_format == 'full_zarr':
+            zarr_path = run_dir / 'texture_bscan_maps.zarr'
+
+            compute_bscan_texture_volumes_to_zarr(
+                volume=volume,
+                upper_bound=upper,
+                lower_bound=lower,
+                out_zarr_path=zarr_path,
+                z_step=1,
+                step=args.step,
+                pad=args.pad,
+                families=DEFAULT_FAMILIES,
+                include_wavelet=not args.no_wavelet,
+                texture_params=texture_params,
+                features_to_keep=features_to_keep,
+                n_jobs=args.n_jobs,
+                single_bscan_n_jobs=args.single_bscan_n_jobs,
+                overwrite=args.overwrite,
+            )
+
+            print(f"we have completed the full zarr textures for {run_tag}: {time.time()-t1} time")
+
+            with open(run_dir / 'zarr_path.txt', 'w') as f:
+                f.write(str(zarr_path) + '\n')
+
+            manifest.append({
+                'tag': run_tag,
+                'texture_output_format': 'full_zarr',
                 'zarr_path': str(zarr_path),
                 'flat_image_zarr': str(art["image_zarr"]),
                 'flat_layers_npz': str(art["flat_layers_npz"]),
@@ -284,18 +440,33 @@ def run_oct_to_zarr(args):
                 'slab_thickness': int(args.slab_thickness),
                 'pad': int(args.pad),
                 'step': int(args.step),
+                'features_to_keep': None if features_to_keep is None else list(features_to_keep),
             })
+
+        else:
+            raise ValueError(f"Unknown texture_output_format: {args.texture_output_format}")
+
+        with open(run_dir / 'texture_params.json', 'w') as f:
+            json.dump(texture_params.as_attrs(), f, indent=2)
 
     with open(volume_out_dir / 'texture_runs_manifest.json', 'w') as f:
         json.dump(manifest, f, indent=2)
 
-    with open(volume_out_dir / 'zarr_paths.txt', 'w') as f:
+    with open(volume_out_dir / 'texture_paths.txt', 'w') as f:
         for row in manifest:
-            f.write(f"{row['tag']}\t{row['zarr_path']}\n")
+            if row['texture_output_format'] == 'compact_npz':
+                f.write(f"{row['tag']}\t{row['compact_npz_path']}\n")
+            else:
+                f.write(f"{row['tag']}\t{row['zarr_path']}\n")
 
     if len(manifest) == 1:
-        with open(volume_out_dir / 'zarr_path.txt', 'w') as f:
-            f.write(str(manifest[0]['zarr_path']) + '\n')
+        row = manifest[0]
+        if row['texture_output_format'] == 'compact_npz':
+            with open(volume_out_dir / 'compact_npz_path.txt', 'w') as f:
+                f.write(str(row['compact_npz_path']) + '\n')
+        else:
+            with open(volume_out_dir / 'zarr_path.txt', 'w') as f:
+                f.write(str(row['zarr_path']) + '\n')
 
 
 
@@ -319,6 +490,11 @@ def make_argparser():
     p.add_argument('--levels-list', type=str, default=None)
     p.add_argument('--gaussian-sigmas', type=str, default=None)
     p.add_argument('--downsample-factors', type=str, default=None)
+
+
+    p.add_argument('--texture_output_format', type=str,choices=['compact_npz','full_zarr'],default='compact_npz')
+    p.add_argument('--features_to_keep', type=str, default=None)
+    p.add_argument('--materialize_full_output', type=str, default=None)
 
 
     p.add_argument('--landmarks', type=str, default=None)
@@ -350,7 +526,7 @@ def main():
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     with open(Path(args.out_dir) / 'run_args.json', 'w') as f:
         json.dump(vars(args), f, indent=2)
-    run_oct_to_zarr(args)
+    run_oct_texture_pipeline(args)
 
 
 if __name__ == '__main__':

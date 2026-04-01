@@ -549,7 +549,15 @@ def vol_string_to_layer_output():
 
 def load_algorithm_key_lookup(excel_path):
     import pandas as pd
-    df = pd.read_excel(excel_path)
+
+    path = Path(path)
+    if path.suffix.lower() == ".csv":
+        df = pd.read_csv(path)
+    elif path.suffix.lower() in {".xlsx", ".xls"}:
+        df = pd.read_excel(path)
+    else:
+        raise ValueError(f"Unsupported file type: {path.suffix}")
+
 
     algo_to_key = {
         'EZ': 'EZ_method_y2_vertical_shifted',
