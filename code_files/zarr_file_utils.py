@@ -9,6 +9,8 @@ import code_files.visualization_utils as vu
 import code_files.file_utils as fu
 from concurrent.futures import ProcessPoolExecutor
 
+C = fu.load_constants()
+
 ### The following are derived from our napari work. Lot's of good stuff here for zarr and dask to enable silky smooth loading and scrolling
 
 # def ensure_image_flat_zarr(vol_path: Path, flatten_with: str, z_stride: int, overwrite: bool = False,dir_suffix: str = '_labels' ) -> Path:
@@ -473,7 +475,7 @@ def ensure_flattened_artifacts(
     layers_root: str | Path,
     annotation_root: str | Path = None,
     make_annotation_zarr: bool=True,
-    flattened_artifacts_root: Path=Path('/Volumes/T9/iowa_research/Han_AIR_Dec_2025/flattened_artifacts'),
+    flattened_artifacts_root: Path=Path(C['flattened_artifacts_root']),
     z_stride: int = 1,
     overwrite: bool = False,
     make_image_zarr: bool = True,
