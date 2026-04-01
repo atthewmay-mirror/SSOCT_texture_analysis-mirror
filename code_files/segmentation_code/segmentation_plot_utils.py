@@ -550,7 +550,7 @@ def flatten_for_plotting(img, line_dict, flattener):
     """as a preproc step, we flatten a bunch of lines and img to aid visualization"""
     flat_img,shift_y_full,target_y = code_files.segmentation_code.flattening_utility_functions.flatten_to_path(img,flattener)
     line_dict_flat = {k:code_files.segmentation_code.flattening_utility_functions.warp_line_by_shift(v,shift_y_full,direction="to_flat") 
-                      for k,v in line_dict.items()}
+                      for k,v in line_dict.items() if v is not None and len(v.shape) != 0}
     return flat_img,line_dict_flat
 
 def narrow_img_by_line(img, line_dict, adjust_by, top_pad=5, bottom_pad=5):

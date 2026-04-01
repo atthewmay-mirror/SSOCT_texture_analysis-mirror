@@ -2864,7 +2864,7 @@ def step_rpe_choroidal_EZ_endpoint_plot(ctx: RPEContext) -> RPEContext:
     # AB.add(ctx.two_layer_dp_ctx_choroidal.img_band,lines = {'y1':ctx.two_layer_dp_ctx_choroidal.y1,'y2': ctx.two_layer_dp_ctx_choroidal.y2},title='original 2-layer')
 
     if ctx.two_layer_dp_ctx_EZ is not None:
-        if ctx.two_layer_dp_ctx_choroidal.debug:
+        if ctx.two_layer_dp_ctx_EZ.debug:
             print("adding debug info")
             dbg = ctx.two_layer_dp_ctx_EZ.debug
             peaks = dbg['peaks']

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import partial
 from itertools import product
-
+import json
 import numpy as np
 from joblib import Parallel, delayed
 from scipy import ndimage
@@ -531,6 +531,452 @@ def resample_map_to_image(feature_map: np.ndarray, meta: DenseMapMeta, order: in
     """Resize a sampled-grid map back to image size for quick visualization."""
     return resize(feature_map, meta.image_shape, order=order, preserve_range=True, anti_aliasing=False).astype(np.float32)
 
+
+_COMPACT_TEXTURE_META_KEY = "__manifest_json__"
+
+
+def _compact_feature_names(npz_obj) -> list[str]:
+    return sorted(k for k in npz_obj.files if k != _COMPACT_TEXTURE_META_KEY)
+
+
+def load_compact_texture_npz(npz_path: str | Path):
+    """
+    Returns:
+        obj: np.load(...) handle
+        manifest: parsed json dict
+    """
+    obj = np.load(npz_path, allow_pickle=False)
+    manifest = json.loads(str(obj[_COMPACT_TEXTURE_META_KEY].item()))
+    return obj, manifest
+
+
+def _compute_global_texture_crop_bounds(
+    upper_bound: np.ndarray,
+    lower_bound: np.ndarray,
+    full_y: int,
+    pad: int,
+    window: int,
+) -> tuple[int, int]:
+    """
+    One global Y crop for the whole volume.
+    This is much cleaner for compact storage than per-B-scan variable-height crops.
+    """
+    y_min = int(np.floor(np.minimum(upper_bound, lower_bound).min() - pad - window))
+    y_max = int(np.ceil(np.maximum(upper_bound, lower_bound).max() + pad + window))
+
+    y_min = max(0, y_min)
+    y_max = min(int(full_y), y_max)
+
+    if y_max <= y_min:
+        raise ValueError(f"Invalid crop bounds: y_min={y_min}, y_max={y_max}")
+
+    return y_min, y_max
+
+
+def _compute_one_bscan_texture_compact(
+    z: int,
+    bscan: np.ndarray,
+    y_min: int,
+    y_max: int,
+    window: int,
+    step: int,
+    families: tuple[str, ...],
+    include_wavelet: bool,
+    levels: int,
+    features_to_keep: tuple[str, ...] | None = None,
+    n_jobs: int = 1,
+) -> tuple[int, dict[str, np.ndarray], DenseMapMeta]:
+    """
+    Compute sampled-grid feature maps on one fixed crop band.
+    No upsampling. No full-size padding.
+    """
+    crop = bscan[y_min:y_max]
+
+    maps, meta = compute_dense_texture_maps(
+        crop,
+        window=window,
+        step=step,
+        mask=None,
+        families=families,
+        include_wavelet=include_wavelet,
+        levels=levels,
+        n_jobs=n_jobs,
+    )
+
+    if features_to_keep is not None:
+        keep = set(features_to_keep)
+        maps = {k: v for k, v in maps.items() if k in keep}
+
+    return z, maps, meta
+
+
+def compute_bscan_texture_volumes_to_compact_npz(
+    volume: np.ndarray,
+    upper_bound: np.ndarray,
+    lower_bound: np.ndarray,
+    out_npz_path: str | Path,
+    z_step: int = 1,
+    window: int = 31,
+    step: int = 4,
+    pad: int = 10,
+    families: tuple[str, ...] = ('firstorder', 'glcm', 'glrlm', 'glszm', 'gldm', 'ngtdm', 'lbp', 'gradient'),
+    include_wavelet: bool = False,
+    levels: int = 32,
+    features_to_keep: tuple[str, ...] | None = None,
+    n_jobs: int = 1,
+    single_bscan_n_jobs: int = 1,
+) -> Path:
+    """
+    Compact dense texture artifact.
+
+    Saves one NPZ per volume with:
+      - one array per feature: (Z_selected, R, C)
+      - one manifest json string with all metadata needed to:
+            1) project en-face directly
+            2) materialize later to full-size npz or zarr
+    """
+    vol = np.asarray(volume)
+    if vol.ndim != 3:
+        raise ValueError('volume must be (Z, Y, X)')
+    if upper_bound.shape != (vol.shape[0], vol.shape[2]):
+        raise ValueError('upper_bound must have shape (Z, X)')
+    if lower_bound.shape != (vol.shape[0], vol.shape[2]):
+        raise ValueError('lower_bound must have shape (Z, X)')
+
+    z_idx = np.arange(0, vol.shape[0], z_step, dtype=int)
+    if len(z_idx) == 0:
+        raise ValueError('No z indices selected')
+
+    y_min, y_max = _compute_global_texture_crop_bounds(
+        upper_bound=upper_bound,
+        lower_bound=lower_bound,
+        full_y=vol.shape[1],
+        pad=pad,
+        window=window,
+    )
+
+    # Probe first slice to discover feature names and sampled grid size.
+    z0 = int(z_idx[0])
+    _, first_maps, first_meta = _compute_one_bscan_texture_compact(
+        z=z0,
+        bscan=vol[z0].astype(np.float32),
+        y_min=y_min,
+        y_max=y_max,
+        window=window,
+        step=step,
+        families=families,
+        include_wavelet=include_wavelet,
+        levels=levels,
+        features_to_keep=features_to_keep,
+        n_jobs=single_bscan_n_jobs,
+    )
+
+    feature_names = sorted(first_maps)
+    if not feature_names:
+        raise ValueError('No feature maps were produced')
+
+    compact_maps = {
+        name: np.full((len(z_idx),) + first_maps[name].shape, np.nan, dtype=np.float32)
+        for name in feature_names
+    }
+
+    for name, arr in first_maps.items():
+        compact_maps[name][0] = arr.astype(np.float32, copy=False)
+
+    if n_jobs == 1:
+        for out_i, z in enumerate(z_idx[1:], start=1):
+            _, maps, _ = _compute_one_bscan_texture_compact(
+                z=int(z),
+                bscan=vol[z].astype(np.float32),
+                y_min=y_min,
+                y_max=y_max,
+                window=window,
+                step=step,
+                families=families,
+                include_wavelet=include_wavelet,
+                levels=levels,
+                features_to_keep=features_to_keep,
+                n_jobs=single_bscan_n_jobs,
+            )
+            for name, arr in maps.items():
+                compact_maps[name][out_i] = arr.astype(np.float32, copy=False)
+    else:
+        with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+            futures = [
+                ex.submit(
+                    _compute_one_bscan_texture_compact,
+                    int(z),
+                    vol[z].astype(np.float32),
+                    y_min,
+                    y_max,
+                    window,
+                    step,
+                    families,
+                    include_wavelet,
+                    levels,
+                    features_to_keep,
+                    single_bscan_n_jobs,
+                )
+                for z in z_idx[1:]
+            ]
+
+            by_z = {}
+            for fut in as_completed(futures):
+                z, maps, _ = fut.result()
+                by_z[int(z)] = maps
+
+        for out_i, z in enumerate(z_idx[1:], start=1):
+            maps = by_z[int(z)]
+            for name, arr in maps.items():
+                compact_maps[name][out_i] = arr.astype(np.float32, copy=False)
+
+    manifest = dict(
+        format='compact_texture_npz_v1',
+        volume_shape=[int(v) for v in vol.shape],          # shape of the flattened volume passed in
+        crop_y_bounds=[int(y_min), int(y_max)],           # full-image Y coords
+        crop_shape=[int(y_max - y_min), int(vol.shape[2])],
+        row_centers_full=(first_meta.row_centers + y_min).astype(int).tolist(),
+        col_centers=first_meta.col_centers.astype(int).tolist(),
+        z_indices=z_idx.astype(int).tolist(),
+        window=int(window),
+        step=int(step),
+        pad=int(pad),
+        levels=int(levels),
+        include_wavelet=bool(include_wavelet),
+        families=list(families),
+        features=feature_names,
+    )
+
+    payload = {
+        _COMPACT_TEXTURE_META_KEY: np.array(json.dumps(manifest)),
+        **compact_maps,
+    }
+
+    out_npz_path = Path(out_npz_path)
+    out_npz_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out_npz_path, **payload)
+    return out_npz_path
+
+
+def instantiate_fullsize_texture_volumes_from_compact(
+    compact_npz_path: str | Path,
+    out_path: str | Path | None = None,
+    output_format: str = 'zarr',   # 'zarr' or 'npz'
+    features_to_keep: tuple[str, ...] | None = None,
+    fill_value: float = np.nan,
+    overwrite: bool = True,
+    chunks: tuple[int, int, int] | None = None,
+):
+    """
+    Materialize compact sampled-band texture maps back into full-size (Z, Y, X)
+    feature volumes. Useful for review/debugging only.
+
+    output_format:
+        'zarr' -> writes one dataset per feature shaped (Z, Y, X)
+        'npz'  -> writes one full array per feature inside one NPZ
+    """
+    obj, manifest = load_compact_texture_npz(compact_npz_path)
+
+    volume_shape = tuple(int(v) for v in manifest['volume_shape'])
+    y_min, y_max = [int(v) for v in manifest['crop_y_bounds']]
+    crop_shape = tuple(int(v) for v in manifest['crop_shape'])
+    z_indices = np.asarray(manifest['z_indices'], dtype=int)
+
+    all_features = _compact_feature_names(obj)
+    if features_to_keep is None:
+        features = all_features
+    else:
+        keep = set(features_to_keep)
+        features = [f for f in all_features if f in keep]
+
+    if not features:
+        raise ValueError('No features selected for instantiation')
+
+    sample_meta = DenseMapMeta(
+        row_centers=np.asarray(manifest['row_centers_full'], dtype=int) - y_min,
+        col_centers=np.asarray(manifest['col_centers'], dtype=int),
+        window=int(manifest['window']),
+        step=int(manifest['step']),
+        image_shape=crop_shape,
+    )
+
+    if output_format == 'npz':
+        full_maps = {}
+        for feat in features:
+            small = obj[feat]  # (Z_selected, R, C)
+            full = np.full(volume_shape, fill_value, dtype=np.float32)
+
+            for local_i, z in enumerate(z_indices):
+                full[z, y_min:y_max, :] = resample_map_to_image(small[local_i], sample_meta)
+
+            full_maps[feat] = full
+
+        if out_path is not None:
+            out_path = Path(out_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(out_path, **full_maps)
+            return out_path
+
+        return full_maps
+
+    if output_format != 'zarr':
+        raise ValueError("output_format must be 'zarr' or 'npz'")
+
+    if out_path is None:
+        raise ValueError("out_path is required when output_format='zarr'")
+
+    root, zarr_datasets = _open_texture_zarr_group(
+        out_zarr_path=out_path,
+        volume_shape=volume_shape,
+        feature_names=features,
+        chunks=chunks,
+        overwrite=overwrite,
+    )
+    root.attrs['source_compact_npz'] = str(compact_npz_path)
+
+    for feat in features:
+        small = obj[feat]
+        for local_i, z in enumerate(z_indices):
+            full_slice = np.full(volume_shape[1:], fill_value, dtype=np.float32)
+            full_slice[y_min:y_max, :] = resample_map_to_image(small[local_i], sample_meta)
+            zarr_datasets[feat][int(z), :, :] = full_slice
+
+    zarr.consolidate_metadata(str(out_path))
+    return Path(out_path)
+
+
+class CompactTextureSlabProjector:
+    """
+    Direct slab projection from the compact sampled-band representation.
+    Avoids materializing full-size dense volumes just to make en-face maps.
+    """
+    def __init__(
+        self,
+        texture_vol: np.ndarray,          # (Z, R, C)
+        row_centers_full: np.ndarray,     # full-image Y coords of sampled rows
+        col_centers: np.ndarray,          # full-image X coords of sampled cols
+    ):
+        arr = np.asarray(texture_vol, dtype=np.float32)
+        if arr.ndim != 3:
+            raise ValueError('texture_vol must be (Z, R, C)')
+
+        self.row_centers_full = np.asarray(row_centers_full, dtype=np.int32)
+        self.col_centers = np.asarray(col_centers, dtype=np.int32)
+
+        if arr.shape[1] != len(self.row_centers_full):
+            raise ValueError('row_centers_full length does not match texture_vol.shape[1]')
+        if arr.shape[2] != len(self.col_centers):
+            raise ValueError('col_centers length does not match texture_vol.shape[2]')
+
+        valid = np.isfinite(arr)
+        vals = np.where(valid, arr, 0.0)
+
+        self.Z, self.R, self.C = arr.shape
+        self.csum = np.empty((self.Z, self.R + 1, self.C), dtype=np.float32)
+        self.ccnt = np.empty((self.Z, self.R + 1, self.C), dtype=np.int32)
+
+        self.csum[:, 0, :] = 0
+        self.ccnt[:, 0, :] = 0
+        np.cumsum(vals, axis=1, out=self.csum[:, 1:, :])
+        np.cumsum(valid.astype(np.int32), axis=1, out=self.ccnt[:, 1:, :])
+
+    def project_between(
+        self,
+        upper_bound: np.ndarray,   # (Z, X) full-image coords
+        lower_bound: np.ndarray,   # (Z, X) full-image coords
+        interp_x: bool = True,
+        full_x: int | None = None,
+    ) -> np.ndarray:
+        upper_s = np.asarray(upper_bound, dtype=np.float32)[:, self.col_centers]
+        lower_s = np.asarray(lower_bound, dtype=np.float32)[:, self.col_centers]
+
+        top = np.minimum(upper_s, lower_s)
+        bottom = np.maximum(upper_s, lower_s)
+
+        start = np.searchsorted(self.row_centers_full, top, side='left')
+        stop = np.searchsorted(self.row_centers_full, bottom, side='right')
+
+        start = np.clip(start, 0, self.R)
+        stop = np.clip(stop, 0, self.R)
+
+        z_idx = np.arange(self.Z)[:, None]
+        c_idx = np.arange(self.C)[None, :]
+
+        sums = self.csum[z_idx, stop, c_idx] - self.csum[z_idx, start, c_idx]
+        cnts = self.ccnt[z_idx, stop, c_idx] - self.ccnt[z_idx, start, c_idx]
+
+        out_sampled = np.full((self.Z, self.C), np.nan, dtype=np.float32)
+        good = cnts > 0
+        out_sampled[good] = sums[good] / cnts[good]
+
+        if not interp_x:
+            return out_sampled
+
+        if full_x is None:
+            full_x = upper_bound.shape[1]
+
+        out_full = np.full((self.Z, full_x), np.nan, dtype=np.float32)
+        for z in range(self.Z):
+            g = np.isfinite(out_sampled[z])
+            if g.sum() >= 2:
+                out_full[z] = np.interp(
+                    np.arange(full_x),
+                    self.col_centers[g],
+                    out_sampled[z, g],
+                )
+            elif g.sum() == 1:
+                out_full[z, :] = out_sampled[z, g][0]
+
+        return out_full
+
+
+def project_texture_compact_npz_to_enface_for_volume(
+    vol_path,
+    compact_npz_path,
+    flat_layers_npz,
+    line_key=None,
+    candidate_slabs=[[5, 15]],
+    features=None,
+    interp_x=True,
+):
+    """
+    Compact-NPZ equivalent of project_texture_zarr_to_enface_for_volume(...).
+    """
+    from pathlib import Path
+    import numpy as np
+    from code_files import file_utils
+
+    vol_path = Path(vol_path)
+    obj, manifest = load_compact_texture_npz(compact_npz_path)
+    flat_layers = np.load(flat_layers_npz)
+
+    if line_key is None:
+        line_key = file_utils.get_algorithm_key_from_filepath(vol_path)
+
+    center = flat_layers[line_key]
+    row_centers_full = np.asarray(manifest['row_centers_full'], dtype=np.int32)
+    col_centers = np.asarray(manifest['col_centers'], dtype=np.int32)
+
+    if features is None:
+        features = _compact_feature_names(obj)
+
+    out = {}
+    for feat in features:
+        proj = CompactTextureSlabProjector(
+            texture_vol=obj[feat],
+            row_centers_full=row_centers_full,
+            col_centers=col_centers,
+        )
+        for bottom_offset, top_offset in candidate_slabs:
+            enface = proj.project_between(
+                center - top_offset,
+                center - bottom_offset,
+                interp_x=interp_x,
+                full_x=center.shape[1],
+            )
+            out[f"{feat}|{bottom_offset}->{top_offset}"] = enface
+
+    return out
 
 def _compute_one_bscan_texture_fullres(
         z: int,

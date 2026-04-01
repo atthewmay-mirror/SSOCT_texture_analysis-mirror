@@ -283,7 +283,8 @@ def main():
     # rpe_segmentation_steps = sp.RPE_STEPS_2_27_26
     # rpe_segmentation_steps = sp.RPE_STEPS_2_28_26
     # rpe_segmentation_steps = sp.RPE_STEPS_3_7_26
-    rpe_segmentation_steps = sp.RPE_STEPS_CHOROIDAL_3_9_26
+    # rpe_segmentation_steps = sp.RPE_STEPS_CHOROIDAL_3_9_26
+    rpe_segmentation_steps = sp.RPE_STEPS_unified_3_19_26
     # if args.RPE_OR_ILM == 'RPE':
     if args.debug or args.max_workers <= 1:
         # Serial, pdb-friendly path
