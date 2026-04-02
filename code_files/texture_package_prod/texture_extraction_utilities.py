@@ -572,16 +572,26 @@ def _open_compact_texture_zarr_group(
     datasets = {}
     shape = (int(z_len), int(rc_shape[0]), int(rc_shape[1]))
     for name in feature_names:
-        datasets[name] = root.create_array(
-            name=name,
-            shape=shape,
-            chunks=chunks,
-            dtype=np.float32,
-            compressor=compressor,
-            overwrite=overwrite,
-            fill_value=np.nan,
-        )
-
+        if hasattr(root, "create_array"):
+            datasets[name] = root.create_array(
+                name=name,
+                shape=shape,
+                chunks=chunks,
+                dtype=np.float32,
+                compressor=compressor,
+                overwrite=overwrite,
+                fill_value=np.nan,
+            )
+        else:
+            datasets[name] = root.create_dataset(
+                name=name,
+                shape=shape,
+                chunks=chunks,
+                dtype=np.float32,
+                compressor=compressor,
+                overwrite=overwrite,
+                fill_value=np.nan,
+            )
     root.attrs['compact_shape'] = shape
     root.attrs['chunks'] = tuple(int(v) for v in chunks)
     return root, datasets
@@ -923,6 +933,9 @@ def project_texture_compact_zarr_to_enface_for_volume(
             out[f"{feat}|{bottom_offset}->{top_offset}"] = enface
 
     return out
+
+
+# THE OLD COMPACT STUFF TO DELETE<<
 
 
 
@@ -1436,16 +1449,27 @@ def _open_texture_zarr_group(
 
     datasets = {}
     for name in feature_names:
-        datasets[name] = root.create_array(
-            name=name,
-            shape=volume_shape,
-            chunks=chunks,
-            dtype=np.float32,
-            compressor=compressor,
-            overwrite=overwrite,
-            fill_value=np.nan,
-        )
 
+        if hasattr(root, "create_array"):
+            datasets[name] = root.create_array(
+                name=name,
+                # shape=shape,
+                chunks=chunks,
+                dtype=np.float32,
+                compressor=compressor,
+                overwrite=overwrite,
+                fill_value=np.nan,
+            )
+        else:
+            datasets[name] = root.create_dataset(
+                name=name,
+                # shape=shape,
+                chunks=chunks,
+                dtype=np.float32,
+                compressor=compressor,
+                overwrite=overwrite,
+                fill_value=np.nan,
+            )
     root.attrs['volume_shape'] = tuple(int(v) for v in volume_shape)
     root.attrs['chunks'] = tuple(int(v) for v in chunks)
     return root, datasets
