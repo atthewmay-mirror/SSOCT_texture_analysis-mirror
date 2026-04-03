@@ -266,7 +266,7 @@ def list_texture_run_dirs(vol_path: Path, texture_zarr_root: str | Path | None):
     for p in sorted(base.iterdir()):
         if not p.is_dir():
             continue
-        if (p / "texture_bscan_maps.zarr").exists():
+        if (p / "texture_bscan_maps.zarr").exists() or (p / "texture_bscan_maps_compact.zarr").exists():
             run_dirs.append(p)
 
     return run_dirs
@@ -281,6 +281,7 @@ def get_texture_zarr_path(
         return None
 
     base = Path(texture_zarr_root) / vol_path.stem
+    print(f"base = {base}")
 
     # legacy non-sweep layout
     legacy = base / "texture_bscan_maps.zarr"
@@ -294,8 +295,12 @@ def get_texture_zarr_path(
 
     # auto-resolve only if exactly one run exists
     run_dirs = list_texture_run_dirs(vol_path, texture_zarr_root)
+    print(f"run_dirs = {run_dirs}")
     if len(run_dirs) == 1:
-        return run_dirs[0] / "texture_bscan_maps.zarr"
+        if (run_dirs[0] / "texture_bscan_maps.zarr").exists():
+            return run_dirs[0] / "texture_bscan_maps.zarr"
+        elif (run_dirs[0] / "texture_bscan_maps_compact.zarr").exists():
+            return run_dirs[0] / "texture_bscan_maps_compact.zarr"
 
     if len(run_dirs) == 0:
         return None

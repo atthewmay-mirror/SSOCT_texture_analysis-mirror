@@ -389,27 +389,6 @@ def haar_like_bands(image: np.ndarray) -> dict[str, np.ndarray]:
     }
 
 
-def retinal_thickness_map(
-    upper_bound: np.ndarray,
-    lower_bound: np.ndarray,
-    abs_value: bool = True,
-) -> np.ndarray:
-    """
-    Return a (Z, X) thickness map from two surfaces.
-    For current use this is usually ilm_smooth minus the algorithm-selected RPE-family line.
-    """
-    upper = np.asarray(upper_bound, dtype=np.float32)
-    lower = np.asarray(lower_bound, dtype=np.float32)
-
-    if upper.shape != lower.shape:
-        raise ValueError('upper_bound and lower_bound must have the same shape')
-
-    out = upper - lower
-    if abs_value:
-        out = np.abs(out)
-    return out.astype(np.float32, copy=False)
-
-
 # ---------- dense map engine ----------
 
 
@@ -1262,90 +1241,6 @@ def instantiate_fullsize_texture_volumes_from_compact(
     return Path(out_path)
 
 
-class CompactTextureSlabProjector:
-    """
-    Direct slab projection from the compact sampled-band representation.
-    Avoids materializing full-size dense volumes just to make en-face maps.
-    """
-    def __init__(
-        self,
-        texture_vol: np.ndarray,          # (Z, R, C)
-        row_centers_full: np.ndarray,     # full-image Y coords of sampled rows
-        col_centers: np.ndarray,          # full-image X coords of sampled cols
-    ):
-        arr = np.asarray(texture_vol, dtype=np.float32)
-        if arr.ndim != 3:
-            raise ValueError('texture_vol must be (Z, R, C)')
-
-        self.row_centers_full = np.asarray(row_centers_full, dtype=np.int32)
-        self.col_centers = np.asarray(col_centers, dtype=np.int32)
-
-        if arr.shape[1] != len(self.row_centers_full):
-            raise ValueError('row_centers_full length does not match texture_vol.shape[1]')
-        if arr.shape[2] != len(self.col_centers):
-            raise ValueError('col_centers length does not match texture_vol.shape[2]')
-
-        valid = np.isfinite(arr)
-        vals = np.where(valid, arr, 0.0)
-
-        self.Z, self.R, self.C = arr.shape
-        self.csum = np.empty((self.Z, self.R + 1, self.C), dtype=np.float32)
-        self.ccnt = np.empty((self.Z, self.R + 1, self.C), dtype=np.int32)
-
-        self.csum[:, 0, :] = 0
-        self.ccnt[:, 0, :] = 0
-        np.cumsum(vals, axis=1, out=self.csum[:, 1:, :])
-        np.cumsum(valid.astype(np.int32), axis=1, out=self.ccnt[:, 1:, :])
-
-    def project_between(
-        self,
-        upper_bound: np.ndarray,   # (Z, X) full-image coords
-        lower_bound: np.ndarray,   # (Z, X) full-image coords
-        interp_x: bool = True,
-        full_x: int | None = None,
-    ) -> np.ndarray:
-        upper_s = np.asarray(upper_bound, dtype=np.float32)[:, self.col_centers]
-        lower_s = np.asarray(lower_bound, dtype=np.float32)[:, self.col_centers]
-
-        top = np.minimum(upper_s, lower_s)
-        bottom = np.maximum(upper_s, lower_s)
-
-        start = np.searchsorted(self.row_centers_full, top, side='left')
-        stop = np.searchsorted(self.row_centers_full, bottom, side='right')
-
-        start = np.clip(start, 0, self.R)
-        stop = np.clip(stop, 0, self.R)
-
-        z_idx = np.arange(self.Z)[:, None]
-        c_idx = np.arange(self.C)[None, :]
-
-        sums = self.csum[z_idx, stop, c_idx] - self.csum[z_idx, start, c_idx]
-        cnts = self.ccnt[z_idx, stop, c_idx] - self.ccnt[z_idx, start, c_idx]
-
-        out_sampled = np.full((self.Z, self.C), np.nan, dtype=np.float32)
-        good = cnts > 0
-        out_sampled[good] = sums[good] / cnts[good]
-
-        if not interp_x:
-            return out_sampled
-
-        if full_x is None:
-            full_x = upper_bound.shape[1]
-
-        out_full = np.full((self.Z, full_x), np.nan, dtype=np.float32)
-        for z in range(self.Z):
-            g = np.isfinite(out_sampled[z])
-            if g.sum() >= 2:
-                out_full[z] = np.interp(
-                    np.arange(full_x),
-                    self.col_centers[g],
-                    out_sampled[z, g],
-                )
-            elif g.sum() == 1:
-                out_full[z, :] = out_sampled[z, g][0]
-
-        return out_full
-
 
 def _compute_one_bscan_texture_fullres(
         z: int,
@@ -1746,81 +1641,6 @@ def project_bscan_texture_to_enface(
         enface = filled
     return enface
 
-class TextureSlabProjector:
-    def __init__(
-        self,
-        texture_vol,
-        reference_line,
-        max_top_offset,
-        max_bottom_offset,
-        extra_pad=0,
-    ):
-        import numpy as np
-
-        ref = np.asarray(reference_line, dtype=np.float32)   # (Z, X)
-
-        top = np.floor(ref - max_top_offset).astype(np.int32)
-        bottom = np.ceil(ref - max_bottom_offset).astype(np.int32)
-
-        y_min = int(np.nanmin(np.minimum(top, bottom))) - extra_pad
-        y_max = int(np.nanmax(np.maximum(top, bottom))) + extra_pad
-
-        full_Y = texture_vol.shape[1]
-        y_min = max(0, y_min)
-        y_max = min(full_Y - 1, y_max)
-
-        arr = np.asarray(texture_vol[:, y_min:y_max + 1, :], dtype=np.float32)
-        self.y0 = y_min
-        self.Z, self.Y, self.X = arr.shape
-
-        valid = np.isfinite(arr)
-        vals = np.where(valid, arr, 0.0)
-
-        vals_yzx = np.transpose(vals, (1, 0, 2))
-        cnts_yzx = np.transpose(valid.astype(np.int32), (1, 0, 2))
-
-        self.csum = np.empty((self.Y + 1, self.Z, self.X), dtype=np.float32)
-        self.ccnt = np.empty((self.Y + 1, self.Z, self.X), dtype=np.int32)
-
-        self.csum[0] = 0
-        self.ccnt[0] = 0
-        np.cumsum(vals_yzx, axis=0, out=self.csum[1:])
-        np.cumsum(cnts_yzx, axis=0, out=self.ccnt[1:])
-
-    def project_between(self, upper_bound, lower_bound, interp_x=True):
-        import numpy as np
-
-        top = np.floor(np.minimum(upper_bound, lower_bound)).astype(np.int32)
-        bottom = np.ceil(np.maximum(upper_bound, lower_bound)).astype(np.int32)
-
-        # move from full-image Y coords into cropped coords
-        top = top - self.y0
-        bottom = bottom - self.y0
-
-        # example here: exclude the boundary rows themselves
-        start = top + 1
-        stop = bottom
-
-        start = np.clip(start, 0, self.Y)
-        stop = np.clip(stop, 0, self.Y)
-
-        z_idx = np.arange(self.Z)[:, None]
-        x_idx = np.arange(self.X)[None, :]
-
-        sums = self.csum[stop, z_idx, x_idx] - self.csum[start, z_idx, x_idx]
-        cnts = self.ccnt[stop, z_idx, x_idx] - self.ccnt[start, z_idx, x_idx]
-
-        out = np.full((self.Z, self.X), np.nan, dtype=np.float32)
-        good = cnts > 0
-        out[good] = sums[good] / cnts[good]
-
-        if interp_x:
-            for z in range(self.Z):
-                g = np.isfinite(out[z])
-                if g.sum() >= 2:
-                    out[z] = np.interp(np.arange(self.X), np.where(g)[0], out[z, g])
-
-        return out
 
 def project_texture_zarr_to_enface_for_volume(
     vol_path,

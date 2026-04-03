@@ -403,44 +403,67 @@ def main():
             state["img_layer"].data = img
             state["img_layer"].metadata["src_path"] = str(vp)
 
-            if args.view_mode == "nonflat":
-                if state["flat_lbl_layer"] is not None:
-                    viewer.layers.remove(state["flat_lbl_layer"])
-                    state["flat_lbl_layer"] = None
+            for lyr in list(state["lbl_layers"].values()):
+                viewer.layers.remove(lyr)
+            state["lbl_layers"] = {}
+            for set_name, arr in lbl.items():
+                lyr = viewer.add_labels(arr, name=set_name, opacity=0.8, scale=scale,visible=False)
+                lyr.color = {0:(0,0,0,0), 1:'magenta', 2:'green', 6:'yellow', 3:'cyan', 4:'orange', 5:'blue'}
+                lyr.color_mode = "direct"
+                lyr.refresh()
+                state["lbl_layers"][set_name] = lyr
 
-                cur_keys = set(state["lbl_layers"].keys())
-                new_keys = set(lbl.keys())
-                if cur_keys != new_keys:
-                    for lyr in list(state["lbl_layers"].values()):
-                        viewer.layers.remove(lyr)
-                    state["lbl_layers"] = {}
-                    for set_name, arr in lbl.items():
-                        lyr = viewer.add_labels(arr, name=set_name, opacity=0.8, scale=scale)
-                        lyr.color = {0:(0,0,0,0), 1:'magenta', 2:'green', 6:'yellow', 3:'cyan', 4:'orange', 5:'blue'}
-                        lyr.color_mode = "direct"
-                        lyr.refresh()
-                        state["lbl_layers"][set_name] = lyr
-                else:
-                    for set_name, arr in lbl.items():
-                        state["lbl_layers"][set_name].data = arr
+            for feat_name, tex_arr in texture.items():
+                viewer.add_image(
+                    tex_arr,
+                    name=f"tex:{feat_name}",
+                    visible=False,
+                    opacity=0.45,
+                    blending="additive",
+                    colormap="inferno",
+                    scale=(1, 1/3, 1),   # same as your B-scan image if that is what you use
+                )
 
-            else:
-                for lyr in list(state["lbl_layers"].values()):
-                    viewer.layers.remove(lyr)
-                state["lbl_layers"] = {}
 
-                if state["flat_lbl_layer"] is None:
-                    state["flat_lbl_layer"] = viewer.add_labels(
-                        lbl,
-                        name=f"{flattener_name}_flat_labels",
-                        opacity=0.8,
-                        scale=scale,
-                    )
-                    state["flat_lbl_layer"].color = {0:(0,0,0,0), 1:'magenta', 2:'green', 6:'yellow', 3:'cyan', 4:'orange', 5:'blue'}
-                    state["flat_lbl_layer"].color_mode = "direct"
-                    state["flat_lbl_layer"].refresh()
-                else:
-                    state["flat_lbl_layer"].data = lbl
+
+            # if args.view_mode == "nonflat":
+            #     if state["flat_lbl_layer"] is not None:
+            #         viewer.layers.remove(state["flat_lbl_layer"])
+            #         state["flat_lbl_layer"] = None
+
+            #     cur_keys = set(state["lbl_layers"].keys())
+            #     new_keys = set(lbl.keys())
+            #     if cur_keys != new_keys:
+            #         for lyr in list(state["lbl_layers"].values()):
+            #             viewer.layers.remove(lyr)
+            #         state["lbl_layers"] = {}
+            #         for set_name, arr in lbl.items():
+            #             lyr = viewer.add_labels(arr, name=set_name, opacity=0.8, scale=scale)
+            #             lyr.color = {0:(0,0,0,0), 1:'magenta', 2:'green', 6:'yellow', 3:'cyan', 4:'orange', 5:'blue'}
+            #             lyr.color_mode = "direct"
+            #             lyr.refresh()
+            #             state["lbl_layers"][set_name] = lyr
+            #     else:
+            #         for set_name, arr in lbl.items():
+            #             state["lbl_layers"][set_name].data = arr
+
+            # else:
+            #     for lyr in list(state["lbl_layers"].values()):
+            #         viewer.layers.remove(lyr)
+            #     state["lbl_layers"] = {}
+
+            #     if state["flat_lbl_layer"] is None:
+            #         state["flat_lbl_layer"] = viewer.add_labels(
+            #             lbl,
+            #             name=f"{flattener_name}_flat_labels",
+            #             opacity=0.8,
+            #             scale=scale,
+            #         )
+            #         state["flat_lbl_layer"].color = {0:(0,0,0,0), 1:'magenta', 2:'green', 6:'yellow', 3:'cyan', 4:'orange', 5:'blue'}
+            #         state["flat_lbl_layer"].color_mode = "direct"
+            #         state["flat_lbl_layer"].refresh()
+            #     else:
+            #         state["flat_lbl_layer"].data = lbl
 
             if annotation_img is not None:
                 if state["annotation_layer"] is None:
