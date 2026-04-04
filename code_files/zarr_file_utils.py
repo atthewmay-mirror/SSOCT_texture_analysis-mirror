@@ -298,8 +298,10 @@ def get_texture_zarr_path(
     print(f"run_dirs = {run_dirs}")
     if len(run_dirs) == 1:
         if (run_dirs[0] / "texture_bscan_maps.zarr").exists():
+            print(f"Returning full-size zarr at {run_dirs[0] / 'texture_bscan_maps.zarr'}")
             return run_dirs[0] / "texture_bscan_maps.zarr"
         elif (run_dirs[0] / "texture_bscan_maps_compact.zarr").exists():
+            print(f"Returning compact-size zarr at {run_dirs[0] / 'texture_bscan_maps_compact.zarr'}")
             return run_dirs[0] / "texture_bscan_maps_compact.zarr"
 
     if len(run_dirs) == 0:
