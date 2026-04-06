@@ -1,3 +1,5 @@
+from __future__ import annotations
+import json
 import os
 import glob
 import numpy as np
@@ -581,3 +583,75 @@ def get_algorithm_key_from_filepath(filepath):
     laterality = re.search(r'(OD|OS)', s).group(1).upper()
     key = (integer_id, laterality)
     return lookup[key]
+
+
+
+def _npz_safe_maps(d: dict[str, np.ndarray], prefix: str) -> dict[str, np.ndarray]:
+    """Prefix keys so multiple map groups can live in one NPZ."""
+    out = {}
+    for k, v in d.items():
+        out[f"{prefix}{k}"] = np.asarray(v, dtype=np.float32)
+    return out
+
+
+def save_prepared_enface_maps(prepped: dict, out_root: str | Path) -> Path:
+    """
+    Save one _prepare_one_volume(...) result as:
+      out_root/
+        <vol_stem>/
+          enface_maps.npz
+          enface_meta.json
+
+    Returns volume output dir.
+    """
+    vol_path = Path(prepped["vol_path"])
+    vol_out_dir = Path(out_root) / vol_path.stem
+    vol_out_dir.mkdir(parents=True, exist_ok=True)
+
+    npz_payload = {}
+    npz_payload.update(_npz_safe_maps(prepped.get("extra_maps", {}), prefix="extra__"))
+    npz_payload.update(_npz_safe_maps(prepped.get("texture_maps", {}), prefix="tex__"))
+    npz_payload.update(_npz_safe_maps(prepped.get("projected_texture_maps", {}), prefix="projtex__"))
+
+    np.savez_compressed(vol_out_dir / "enface_maps.npz", **npz_payload)
+
+    meta = {
+        "input_volume": str(vol_path),
+        "volume_stem": vol_path.stem,
+        "reference_key": prepped.get("reference_key"),
+        "flat_layers_npz": str(prepped["art"].get("flat_layers_npz", "")),
+        "flat_image_zarr": str(prepped["art"].get("image_zarr", "")),
+        "projected_texture_stat": prepped.get("projected_texture_stat"),
+        "extra_map_keys": sorted(prepped.get("extra_maps", {}).keys()),
+        "texture_map_keys": sorted(prepped.get("texture_maps", {}).keys()),
+        "projected_texture_map_keys": sorted(prepped.get("projected_texture_maps", {}).keys()),
+    }
+    with open(vol_out_dir / "enface_meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    return vol_out_dir
+
+def load_saved_enface_maps(vol_out_dir: str | Path):
+    vol_out_dir = Path(vol_out_dir)
+    obj = np.load(vol_out_dir / "enface_maps.npz")
+
+    extra_maps = {}
+    texture_maps = {}
+    projected_texture_maps = {}
+
+    for k in obj.files:
+        if k.startswith("extra__"):
+            extra_maps[k.removeprefix("extra__")] = obj[k]
+        elif k.startswith("tex__"):
+            texture_maps[k.removeprefix("tex__")] = obj[k]
+        elif k.startswith("projtex__"):
+            projected_texture_maps[k.removeprefix("projtex__")] = obj[k]
+
+    meta = json.load(open(vol_out_dir / "enface_meta.json", "r"))
+
+    return {
+        "meta": meta,
+        "extra_maps": extra_maps,
+        "texture_maps": texture_maps,
+        "projected_texture_maps": projected_texture_maps,
+    }

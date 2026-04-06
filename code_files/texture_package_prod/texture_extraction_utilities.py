@@ -174,8 +174,8 @@ def compute_volume_level_band_clip_values(
     texture_params: TextureSweepParams,
     include_wavelet: bool,
     clip_percentiles: tuple[float, float] = (1, 99),
-    sample_z_step: int = 2,
-    sample_xy_step: int = 2,
+    sample_z_step: int = 1,
+    sample_xy_step: int = 1,
 ) -> dict[str, tuple[float, float]]:
     """
     Compute one robust (lo, hi) pair per band for the whole volume.

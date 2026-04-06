@@ -1,12 +1,19 @@
 from __future__ import annotations
+import json
+from pathlib import Path
+from skimage.transform import resize
+
 
 import numpy as np
 
+import code_files.file_utils as fu
 from code_files.texture_package_prod.texture_extraction_utilities import (
     compute_dense_texture_maps,
 )
 
 from pathlib import Path
+
+import code_files.zarr_file_utils as zfu
 
 def _reduce_between_bounds(
     volume,
@@ -538,3 +545,334 @@ class TextureSlabProjector:
                     out[z] = np.interp(np.arange(self.X), np.where(g)[0], out[z, g])
 
         return out
+
+
+
+
+def make_enface_isotropic_x(
+    arr: np.ndarray,
+    x_scale: float = 2.0,
+    order: int = 1,
+) -> np.ndarray:
+    """
+    Resample a (Z, X) en-face map so pixels become isotropic by scaling X only.
+
+    For your current maps, use x_scale=2.0:
+        (1024, 512) -> (1024, 1024)
+
+    order:
+      1 for continuous feature maps
+      0 for masks / labels
+    """
+    arr = np.asarray(arr)
+    out_x = int(round(arr.shape[1] * float(x_scale)))
+    out = resize(
+        arr.astype(np.float32, copy=False),
+        (arr.shape[0], out_x),
+        order=order,
+        preserve_range=True,
+        anti_aliasing=(order > 0),
+    )
+    if order == 0:
+        return out > 0.5 if arr.dtype == bool else np.rint(out).astype(arr.dtype, copy=False)
+    return out.astype(np.float32, copy=False)
+
+
+
+
+##
+import json
+from pathlib import Path
+
+import numpy as np
+import zarr
+
+
+def _load_compact_manifest(compact_zarr_path: str | Path) -> dict:
+    root = zarr.open_group(str(compact_zarr_path), mode="r")
+    manifest_json = root.attrs.get("manifest_json", None)
+    if manifest_json is None:
+        raise ValueError(f"No manifest_json found in {compact_zarr_path}")
+    return json.loads(manifest_json)
+
+
+def _interp_along_x_to_full_width(
+    arr_zx: np.ndarray,
+    col_centers: np.ndarray,
+    full_x: int,
+) -> np.ndarray:
+    """
+    Input arr_zx shape:
+      (Zsmall, Csampled), where columns correspond to manifest['col_centers'].
+    Output:
+      (Zsmall, full_x)
+    """
+    arr_zx = np.asarray(arr_zx, dtype=np.float32)
+    out = np.full((arr_zx.shape[0], full_x), np.nan, dtype=np.float32)
+
+    xx = np.arange(full_x, dtype=np.float32)
+    col_centers = np.asarray(col_centers, dtype=np.float32)
+
+    for z in range(arr_zx.shape[0]):
+        good = np.isfinite(arr_zx[z])
+        if good.sum() >= 2:
+            out[z] = np.interp(xx, col_centers[good], arr_zx[z, good])
+        elif good.sum() == 1:
+            out[z, :] = arr_zx[z, good][0]
+
+    return out
+
+
+def _interp_along_z_to_full_depth(
+    arr_zx: np.ndarray,
+    z_indices: np.ndarray,
+    full_z: int,
+) -> np.ndarray:
+    """
+    Input arr_zx shape:
+      (Zsampled, Xfull_or_sampled), where rows correspond to manifest['z_indices'].
+    Output:
+      (full_z, X)
+    """
+    arr_zx = np.asarray(arr_zx, dtype=np.float32)
+    out = np.full((full_z, arr_zx.shape[1]), np.nan, dtype=np.float32)
+
+    zz = np.arange(full_z, dtype=np.float32)
+    z_indices = np.asarray(z_indices, dtype=np.float32)
+
+    for x in range(arr_zx.shape[1]):
+        good = np.isfinite(arr_zx[:, x])
+        if good.sum() >= 2:
+            out[:, x] = np.interp(zz, z_indices[good], arr_zx[good, x])
+        elif good.sum() == 1:
+            out[:, x] = arr_zx[good, x][0]
+
+    return out
+
+
+def upsample_projected_compact_enface_map(
+    projected_map: np.ndarray,
+    compact_zarr_path: str | Path | None = None,
+    manifest: dict | None = None,
+    full_shape: tuple[int, int] | None = None,
+) -> np.ndarray:
+    """
+    Upsample an already-projected compact texture en-face map to full (Z, X),
+    without instantiating the full texture volume zarr.
+
+    Handles both cases:
+      1) projected_map is still compact in X and Z
+      2) projected_map is already full in X but compact in Z
+         (this is what you usually get if projection used upsample=True)
+
+    If full_shape is None, use manifest['volume_shape'] -> (full_z, full_x).
+    """
+    if manifest is None:
+        if compact_zarr_path is None:
+            raise ValueError("Provide either manifest or compact_zarr_path")
+        manifest = _load_compact_manifest(compact_zarr_path)
+
+    arr = np.asarray(projected_map, dtype=np.float32)
+
+    vol_shape = tuple(int(v) for v in manifest["volume_shape"])
+    full_z = int(vol_shape[0])
+    full_x = int(vol_shape[2])
+
+    if full_shape is not None:
+        full_z, full_x = map(int, full_shape)
+
+    z_indices = np.asarray(manifest["z_indices"], dtype=int)
+    col_centers = np.asarray(manifest["col_centers"], dtype=int)
+
+    # X upsample only if still sampled-grid width.
+    if arr.shape[1] == len(col_centers) and full_x != len(col_centers):
+        arr = _interp_along_x_to_full_width(arr, col_centers=col_centers, full_x=full_x)
+    elif arr.shape[1] != full_x:
+        raise ValueError(
+            f"Projected map X size {arr.shape[1]} does not match either "
+            f"len(col_centers)={len(col_centers)} or full_x={full_x}"
+        )
+
+    # Z upsample only if still compact in Z.
+    if arr.shape[0] == len(z_indices) and full_z != len(z_indices):
+        arr = _interp_along_z_to_full_depth(arr, z_indices=z_indices, full_z=full_z)
+    elif arr.shape[0] != full_z:
+        raise ValueError(
+            f"Projected map Z size {arr.shape[0]} does not match either "
+            f"len(z_indices)={len(z_indices)} or full_z={full_z}"
+        )
+
+    return arr.astype(np.float32, copy=False)
+
+
+def upsample_projected_compact_enface_maps(
+    projected_maps: dict[str, np.ndarray],
+    compact_zarr_path: str | Path | None = None,
+    manifest: dict | None = None,
+    full_shape: tuple[int, int] | None = None,
+) -> dict[str, np.ndarray]:
+    if manifest is None:
+        if compact_zarr_path is None:
+            raise ValueError("Provide either manifest or compact_zarr_path")
+        manifest = _load_compact_manifest(compact_zarr_path)
+
+    return {
+        k: upsample_projected_compact_enface_map(
+            v,
+            manifest=manifest,
+            full_shape=full_shape,
+        )
+        for k, v in projected_maps.items()
+    }
+
+
+def _parse_csv_arg(text):
+    if text is None or str(text).strip() == "":
+        return None
+    return tuple(x.strip() for x in str(text).split(",") if x.strip())
+
+
+def _resolve_compact_texture_zarr_path(texture_root_dir, vol_path, texture_run=None):
+    volume_dir = Path(texture_root_dir) / vol_path.stem
+    if not volume_dir.exists():
+        raise FileNotFoundError(f"Could not find texture volume dir: {volume_dir}")
+
+    if texture_run is not None:
+        zp = volume_dir / texture_run / "texture_bscan_maps_compact.zarr"
+        if not zp.exists():
+            raise FileNotFoundError(f"Could not find compact zarr for run {texture_run}: {zp}")
+        return zp
+
+    # txt_path = volume_dir / "compact_zarr_path.txt"
+    # if txt_path.exists():
+    #     zp = Path(txt_path.read_text().strip())
+    #     if not zp.exists():
+    #         raise FileNotFoundError(f"compact_zarr_path.txt points to missing file: {zp}")
+    #     return zp
+
+    run_paths = sorted(volume_dir.glob("*/texture_bscan_maps_compact.zarr"))
+    if len(run_paths) == 1:
+        return run_paths[0]
+    if len(run_paths) == 0:
+        raise FileNotFoundError(f"No compact texture zarr found under {volume_dir}")
+
+    raise ValueError(
+        f"Multiple compact texture runs found for {vol_path.stem}: "
+        f"{[p.parent.name for p in run_paths]}. Pass --texture_run."
+    )
+
+
+def subset_dict(d, keys):
+    return {k: d[k] for k in keys if k in d}
+
+
+def prepare_one_volume_texture_enfaces(vol_path, args):
+    vol_path = Path(vol_path)
+    reference_key = fu.get_algorithm_key_from_filepath(vol_path)
+    print(f"[{vol_path.stem}] using reference key: {reference_key}")
+
+    art = zfu.ensure_flattened_artifacts(
+        vol_path=vol_path,
+        flatten_with=reference_key,
+        layers_root=args.layers_root,
+        z_stride=1,
+        overwrite=args.overwrite_flatten,
+        make_image_zarr=True,
+        make_label_zarr=False,
+        make_annotation_zarr=False,
+        save_flat_layers_npz=True,
+    )
+
+    flat_volume = zarr.open_group(str(art["image_zarr"]), mode="r")["data"]
+    flat_layers = np.load(art["flat_layers_npz"])
+
+    extra_maps = compute_extra_enface_maps(
+        flat_volume=flat_volume,
+        flat_layers=flat_layers,
+        reference_key=reference_key,
+        slab_offsets=args.slab_offsets,
+        interp_x=True,
+    )
+
+    texture_input_keys = [f"slab_mean|{b}->{t}" for b, t in args.slab_offsets]
+    if args.include_full_retina:
+        texture_input_keys.append("full_retina_mean")
+    texture_input_maps = subset_dict(extra_maps, texture_input_keys)
+
+    texture_maps = compute_textures_on_enface_maps(
+        enface_maps=texture_input_maps,
+        window=args.texture_window,
+        step=args.texture_step,
+        include_wavelet=False,
+        levels=args.texture_levels,
+        n_jobs=args.texture_n_jobs,
+    )
+
+    projected_texture_maps = {}
+    if args.texture_root_dir is not None:
+        compact_zarr_path = _resolve_compact_texture_zarr_path(
+            texture_root_dir=args.texture_root_dir,
+            vol_path=vol_path,
+            texture_run=args.texture_run,
+        )
+
+        projected_texture_features = _parse_csv_arg(args.projected_texture_features)
+
+        projected_texture_maps = project_texture_compact_zarr_to_enface_for_volume(
+            vol_path=vol_path,
+            compact_zarr_path=compact_zarr_path,
+            flat_layers_npz=art["flat_layers_npz"],
+            line_key=reference_key,
+            candidate_slabs=args.slab_offsets,
+            features=projected_texture_features,
+            stat=args.projected_texture_stat,
+            upsample=True,
+            n_jobs=args.project_texture_n_jobs,
+        )
+
+    # After projected_texture_maps are created:
+    if args.texture_root_dir is not None:
+        projected_texture_maps = upsample_projected_compact_enface_maps(
+            projected_texture_maps,
+            compact_zarr_path=compact_zarr_path,
+        )
+
+    # Then make everything isotropic for downstream geometry:
+    extra_maps = make_enface_dict_isotropic_x(extra_maps, x_scale=2.0, order=1)
+    texture_maps = make_enface_dict_isotropic_x(texture_maps, x_scale=2.0, order=1)
+    projected_texture_maps = make_enface_dict_isotropic_x(projected_texture_maps, x_scale=2.0, order=1)
+
+    return dict(
+        vol_path=vol_path,
+        reference_key=reference_key,
+        art=art,
+        flat_volume=flat_volume,
+        flat_layers=flat_layers,
+        extra_maps=extra_maps,
+        texture_maps=texture_maps,
+        projected_texture_maps=projected_texture_maps,
+        projected_texture_stat=args.projected_texture_stat,
+    )
+
+
+def make_enface_dict_isotropic_x(
+    maps: dict[str, np.ndarray],
+    x_scale: float = 2.0,
+    order: int = 1,
+) -> dict[str, np.ndarray]:
+    return {
+        k: make_enface_isotropic_x(v, x_scale=x_scale, order=order)
+        for k, v in maps.items()
+    }
+
+
+def scale_point_xy_x(pt_xy: tuple[float, float], x_scale: float = 2.0) -> tuple[float, float]:
+    x, y = pt_xy
+    return float(x * x_scale), float(y)
+
+
+def scale_points_dict_xy_x(
+    points_xy: dict[str, tuple[float, float]],
+    x_scale: float = 2.0,
+) -> dict[str, tuple[float, float]]:
+    return {k: scale_point_xy_x(v, x_scale=x_scale) for k, v in points_xy.items()}
