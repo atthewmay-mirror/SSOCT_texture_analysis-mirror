@@ -180,10 +180,9 @@ def compute_extra_enface_maps(
 
     return out
 
-
 def compute_textures_on_enface_maps(
     enface_maps,
-    window=31,
+    windows=(31,),
     step=4,
     families=("firstorder", "glcm", "glrlm", "glszm", "gldm", "ngtdm", "lbp", "gradient"),
     include_wavelet=False,
@@ -192,7 +191,7 @@ def compute_textures_on_enface_maps(
     n_jobs=8,
 ):
     """
-    Run the usual texture family on each 2D en-face map.
+    Run the usual texture family on each 2D en-face map for multiple window sizes.
     """
     out = {}
 
@@ -200,30 +199,31 @@ def compute_textures_on_enface_maps(
         arr = np.asarray(arr, dtype=np.float32)
         mask = np.isfinite(arr)
 
-        feat_maps, meta = compute_dense_texture_maps(
-            image=arr,
-            window=window,
-            step=step,
-            mask=mask,
-            families=families,
-            include_wavelet=include_wavelet,
-            levels=levels,
-            min_valid_frac=min_valid_frac,
-            n_jobs=n_jobs,
-        )
+        for window in windows:
+            feat_maps, meta = compute_dense_texture_maps(
+                image=arr,
+                window=window,
+                step=step,
+                mask=mask,
+                families=families,
+                include_wavelet=include_wavelet,
+                levels=levels,
+                min_valid_frac=min_valid_frac,
+                n_jobs=n_jobs,
+            )
 
-        if step != 1:
-            feat_maps = {
-                feat_name: resample_map_to_image(feat_map, meta)
-                for feat_name, feat_map in feat_maps.items()
-            }
+            if step != 1:
+                feat_maps = {
+                    feat_name: resample_map_to_image(feat_map, meta)
+                    for feat_name, feat_map in feat_maps.items()
+                }
 
-        for feat_name, feat_map in feat_maps.items():
-            out[f"{map_name}__{feat_name}"] = np.asarray(feat_map, dtype=np.float32)
-
+            for feat_name, feat_map in feat_maps.items():
+                out[f"{map_name}__w{window}__{feat_name}"] = np.asarray(
+                    feat_map, dtype=np.float32
+                )
 
     return out
-
 
 class CompactTextureSlabProjector:
     """
@@ -809,7 +809,8 @@ def prepare_one_volume_texture_enfaces(vol_path, args):
 
     texture_maps = compute_textures_on_enface_maps(
         enface_maps=texture_input_maps,
-        window=args.texture_window,
+        windows=args.texture_windows,
+        families=args.texture_enface_families,
         step=args.texture_step,
         include_wavelet=False,
         levels=args.texture_levels,

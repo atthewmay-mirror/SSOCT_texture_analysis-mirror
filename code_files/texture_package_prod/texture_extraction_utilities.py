@@ -35,6 +35,16 @@ class DenseMapMeta:
 
 
 @dataclass(frozen=True)
+class GLCMParams:
+    distances: tuple[int, ...] = (1,)
+    angles_deg: tuple[float, ...] = (0.0, 45.0, 90.0, 135.0)
+    aggregate_distances: bool = False
+    aggregate_angles: bool = True
+
+    def angles_rad(self) -> tuple[float, ...]:
+        return tuple(np.deg2rad(a) for a in self.angles_deg)
+
+@dataclass(frozen=True)
 class TextureSweepParams:
     """
     Same class used for:
@@ -233,18 +243,73 @@ def _nanmean_std_percentiles(values: np.ndarray, bins: int = 32) -> dict[str, fl
         'p90': float(np.nanpercentile(values, 90)),
     }
 
-def glcm_features_patch(patch_q: np.ndarray, levels: int = 32) -> dict[str, float]:
+
+def glcm_features_patch(
+    patch_q: np.ndarray,
+    levels: int = 32,
+    glcm_params: GLCMParams | None = None,
+) -> dict[str, float]:
+    """
+    Flexible GLCM extraction.
+
+    If aggregate_distances=False and aggregate_angles=True:
+        returns separate distance-specific features, e.g.
+            glcm_d1_contrast, glcm_d3_contrast, ...
+
+    If aggregate_distances=True and aggregate_angles=True:
+        returns pooled features, e.g.
+            glcm_contrast, glcm_entropy, ...
+    """
+    if glcm_params is None:
+        glcm_params = GLCMParams()
+
+    distances = tuple(int(d) for d in glcm_params.distances)
+    angles_rad = tuple(float(a) for a in glcm_params.angles_rad())
+
     glcm = graycomatrix(
         patch_q,
-        distances=[1], # EDIT? We may want longer range dependencies. The out would have to be named by the distnacees I think.
-        angles=[0, np.pi / 4, np.pi / 2, 3 * np.pi / 4],
+        distances=list(distances),
+        angles=list(angles_rad),
         levels=levels,
         symmetric=True,
         normed=True,
     )
-    out = {f'glcm_{name}': float(graycoprops(glcm, name).mean()) for name in GLCM_FEATURES}
-    p = glcm.astype(np.float64)
-    out['glcm_entropy'] = float((-(p * np.log2(p + 1e-12))).sum(axis=(0, 1)).mean())
+
+    out = {}
+
+    if glcm_params.aggregate_distances and glcm_params.aggregate_angles:
+        for name in GLCM_FEATURES:
+            out[f'glcm_{name}'] = float(graycoprops(glcm, name).mean())
+
+        p = glcm.astype(np.float64, copy=False)
+        out['glcm_entropy'] = float((-(p * np.log2(p + 1e-12))).sum(axis=(0, 1)).mean())
+        return out
+
+    if (not glcm_params.aggregate_distances) and glcm_params.aggregate_angles:
+        for di, d in enumerate(distances):
+            for name in GLCM_FEATURES:
+                vals = graycoprops(glcm, name)[di, :]
+                out[f'glcm_d{int(d)}_{name}'] = float(np.nanmean(vals))
+
+        p = glcm.astype(np.float64, copy=False)
+        ent = (-(p * np.log2(p + 1e-12))).sum(axis=(0, 1))  # (D, A)
+        for di, d in enumerate(distances):
+            out[f'glcm_d{int(d)}_entropy'] = float(np.nanmean(ent[di, :]))
+        return out
+
+    for di, d in enumerate(distances):
+        for ai, ang_deg in enumerate(glcm_params.angles_deg):
+            ang_tag = int(round(float(ang_deg))) % 180
+            for name in GLCM_FEATURES:
+                vals = graycoprops(glcm, name)
+                out[f'glcm_d{int(d)}_a{ang_tag}_{name}'] = float(vals[di, ai])
+
+        p = glcm.astype(np.float64, copy=False)
+        ent = (-(p * np.log2(p + 1e-12))).sum(axis=(0, 1))
+        for ai, ang_deg in enumerate(glcm_params.angles_deg):
+            ang_tag = int(round(float(ang_deg))) % 180
+            out[f'glcm_d{int(d)}_a{ang_tag}_entropy'] = float(ent[di, ai])
+
     return out
 
 
@@ -426,6 +491,148 @@ def gradient_orientation_features_patch(patch: np.ndarray) -> dict[str, float]:
     }
 
 
+def _safe_entropy_from_uint(values_q: np.ndarray, levels: int) -> float:
+    hist = np.bincount(values_q.ravel(), minlength=int(levels)).astype(np.float64)
+    hist_sum = hist.sum()
+    if hist_sum <= 0:
+        return np.nan
+    probs = hist / hist_sum
+    return float(scipy_entropy(probs + 1e-12, base=2))
+
+
+def _finite_patch_values(patch: np.ndarray) -> np.ndarray:
+    vals = np.asarray(patch, dtype=np.float32)
+    vals = vals[np.isfinite(vals)]
+    return vals
+
+
+def heterogeneity_features_patch(
+    patch: np.ndarray,
+    levels: int = 32,
+    centered_clip_percentile: float = 95.0,
+) -> dict[str, float]:
+    """
+    Patch-level heterogeneity features intended to reflect roughness / stipple /
+    spread more than absolute brightness.
+
+    Returns:
+        hetero_std
+        hetero_mad
+        hetero_iqr
+        hetero_entropy_centered
+    """
+    vals = _finite_patch_values(patch)
+    if vals.size == 0:
+        return {
+            'hetero_std': np.nan,
+            'hetero_mad': np.nan,
+            'hetero_iqr': np.nan,
+            'hetero_entropy_centered': np.nan,
+        }
+
+    med = float(np.nanmedian(vals))
+    centered = vals - med
+
+    std = float(np.nanstd(vals))
+    mad = float(np.nanmedian(np.abs(centered)))
+    q25, q75 = np.nanpercentile(vals, [25, 75])
+    iqr = float(q75 - q25)
+
+    scale = float(np.nanpercentile(np.abs(centered), centered_clip_percentile))
+    if (not np.isfinite(scale)) or scale <= 0:
+        ent_centered = 0.0
+    else:
+        centered_q = np.clip(
+            np.round(((centered / scale) + 1.0) * 0.5 * (levels - 1)),
+            0,
+            levels - 1,
+        ).astype(np.uint8)
+        ent_centered = _safe_entropy_from_uint(centered_q, levels=levels)
+
+    return {
+        'hetero_std': std,
+        'hetero_mad': mad,
+        'hetero_iqr': iqr,
+        'hetero_entropy_centered': ent_centered,
+    }
+
+
+def _rms_energy(arr: np.ndarray) -> float:
+    arr = np.asarray(arr, dtype=np.float32)
+    good = np.isfinite(arr)
+    if not good.any():
+        return np.nan
+    x = arr[good]
+    return float(np.sqrt(np.mean(x * x)))
+
+
+def band_energy_features_patch(
+    patch: np.ndarray,
+    sigma_base_frac: float = 1 / 16,
+) -> dict[str, float]:
+    """
+    Multi-scale band-energy summary.
+
+    fine   = original - mildly blurred
+    medium = mild blur - stronger blur
+    coarse = stronger blur - strongest blur
+
+    Intended to separate:
+        - fine stipple / islands
+        - medium patchiness
+        - coarse mottling / broad zones
+
+    Returns:
+        band_fine_energy
+        band_medium_energy
+        band_coarse_energy
+        band_fine_to_coarse
+        band_fine_frac
+        band_coarse_frac
+    """
+    p = np.asarray(patch, dtype=np.float32)
+    good = np.isfinite(p)
+    if not good.any():
+        return {
+            'band_fine_energy': np.nan,
+            'band_medium_energy': np.nan,
+            'band_coarse_energy': np.nan,
+            'band_fine_to_coarse': np.nan,
+            'band_fine_frac': np.nan,
+            'band_coarse_frac': np.nan,
+        }
+
+    fill = float(np.nanmedian(p[good]))
+    p = np.where(np.isfinite(p), p, fill)
+
+    # Remove patch baseline so this is more about texture structure than brightness
+    p = p - float(np.nanmedian(p))
+
+    base_sigma = max(1.0, float(min(p.shape)) * float(sigma_base_frac))
+
+    g1 = ndimage.gaussian_filter(p, sigma=base_sigma, mode='nearest')
+    g2 = ndimage.gaussian_filter(p, sigma=base_sigma * 2.0, mode='nearest')
+    g3 = ndimage.gaussian_filter(p, sigma=base_sigma * 4.0, mode='nearest')
+
+    fine = p - g1
+    medium = g1 - g2
+    coarse = g2 - g3
+
+    e_fine = _rms_energy(fine)
+    e_medium = _rms_energy(medium)
+    e_coarse = _rms_energy(coarse)
+
+    total = max(e_fine + e_medium + e_coarse, 1e-8)
+
+    return {
+        'band_fine_energy': e_fine,
+        'band_medium_energy': e_medium,
+        'band_coarse_energy': e_coarse,
+        'band_fine_to_coarse': float(e_fine / max(e_coarse, 1e-8)),
+        'band_fine_frac': float(e_fine / total),
+        'band_coarse_frac': float(e_coarse / total),
+    }
+
 # ---------- filters ----------
 
 def haar_like_bands(image: np.ndarray) -> dict[str, np.ndarray]:
@@ -450,18 +657,22 @@ def haar_like_bands(image: np.ndarray) -> dict[str, np.ndarray]:
 
 # ---------- dense map engine ----------
 
-
 def _feature_dict_for_patch(
     patch: np.ndarray,
     patch_q: np.ndarray,
     families: tuple[str, ...],
     levels: int,
+    glcm_params: GLCMParams | None = None,
 ) -> dict[str, float]:
     out = {}
     if 'firstorder' in families:
         out.update(_nanmean_std_percentiles(patch, bins=levels))
+    if 'heterogeneity' in families:
+        out.update(heterogeneity_features_patch(patch, levels=levels))
+    if 'band_energy' in families:
+        out.update(band_energy_features_patch(patch))
     if 'glcm' in families:
-        out.update(glcm_features_patch(patch_q, levels=levels))
+        out.update(glcm_features_patch(patch_q, levels=levels, glcm_params=glcm_params))
     if 'glrlm' in families:
         out.update(glrlm_features_patch(patch_q, levels=levels))
     if 'glszm' in families:
@@ -486,6 +697,7 @@ def _row_worker(
     min_valid_frac: float,
     families: tuple[str, ...],
     levels: int,
+    glcm_params: GLCMParams | None = None,
 ) -> list[tuple[int, dict[str, float]]]:
     rad = window // 2
     row_results = []
@@ -493,36 +705,54 @@ def _row_worker(
         r0, r1 = r - rad, r + rad + 1
         c0, c1 = c - rad, c + rad + 1
         patch_mask = None if mask is None else mask[r0:r1, c0:c1]
+
         if patch_mask is not None and patch_mask.mean() < min_valid_frac:
             row_results.append((c, {}))
             continue
+
         feats = {}
         for band_name, image in images.items():
             patch = image[r0:r1, c0:c1]
             patch_q = quantized[band_name][r0:r1, c0:c1]
-            patch_feats = _feature_dict_for_patch(patch, patch_q, families=families, levels=levels)
+            patch_feats = _feature_dict_for_patch(
+                patch,
+                patch_q,
+                families=families,
+                levels=levels,
+                glcm_params=glcm_params,
+            )
             for k, v in patch_feats.items():
                 feats[f'{band_name}__{k}'] = v
+
         row_results.append((c, feats))
     return row_results
+
 
 def compute_dense_texture_maps(
     image: np.ndarray,
     window: int = 31,
     step: int = 2,
     mask: np.ndarray | None = None,
-    families: tuple[str, ...] = ('firstorder', 'glcm', 'glrlm', 'glszm', 'gldm', 'ngtdm', 'lbp', 'gradient'),
+    families: tuple[str, ...] = (
+        'firstorder', 'heterogeneity', 'band_energy',
+        'glcm', 'glrlm', 'glszm', 'gldm', 'ngtdm', 'lbp', 'gradient'
+    ),
     include_wavelet: bool = True,
     levels: int = 16,
     min_valid_frac: float = 0.5,
     n_jobs: int = 1,
     band_clip_values: dict[str, tuple[float, float]] | None = None,
+    glcm_params: GLCMParams | None = None,
 ) -> tuple[dict[str, np.ndarray], DenseMapMeta]:
     """
     Generic dense texture engine.
 
-    Output maps live on the sampled grid. Use step=1 or 2 for dense maps, larger step for fast previews.
+    Output maps live on the sampled grid. Use step=1 or 2 for dense maps, larger
+    step for fast previews.
     """
+    if glcm_params is None:
+        glcm_params = GLCMParams()
+
     img = image.astype(np.float32)
     if img.ndim != 2:
         raise ValueError('compute_dense_texture_maps expects one 2D image')
@@ -547,7 +777,18 @@ def compute_dense_texture_maps(
 
     worker = delayed(_row_worker)
     results = Parallel(n_jobs=n_jobs, prefer='processes')(
-        worker(r, cols, bands, quantized, window, mask, min_valid_frac, families, levels)
+        worker(
+            r,
+            cols,
+            bands,
+            quantized,
+            window,
+            mask,
+            min_valid_frac,
+            families,
+            levels,
+            glcm_params,
+        )
         for r in rows
     )
 
@@ -555,7 +796,11 @@ def compute_dense_texture_maps(
     for row in results:
         for _, feats in row:
             feature_names.update(feats)
-    maps = {name: np.full((len(rows), len(cols)), np.nan, dtype=np.float32) for name in sorted(feature_names)}
+
+    maps = {
+        name: np.full((len(rows), len(cols)), np.nan, dtype=np.float32)
+        for name in sorted(feature_names)
+    }
 
     for i, row in enumerate(results):
         for j, (_, feats) in enumerate(row):
@@ -570,7 +815,6 @@ def compute_dense_texture_maps(
         image_shape=img.shape,
     )
     return maps, meta
-
 
 def resample_map_to_image(feature_map: np.ndarray, meta: DenseMapMeta, order: int = 1) -> np.ndarray:
     """Resize a sampled-grid map back to image size for quick visualization."""
@@ -669,7 +913,7 @@ def _submit_one_compact_bscan_future(
     features_to_keep: tuple[str, ...] | None,
     single_bscan_n_jobs: int,
     band_clip_values: dict[str, tuple[float, float]] | None = None,
-
+    glcm_params: GLCMParams | None = None,
 ):
     return ex.submit(
         _compute_one_bscan_texture_compact,
@@ -683,7 +927,8 @@ def _submit_one_compact_bscan_future(
         texture_params=texture_params,
         features_to_keep=features_to_keep,
         n_jobs=single_bscan_n_jobs,
-        band_clip_values = band_clip_values
+        band_clip_values=band_clip_values,
+        glcm_params=glcm_params,
     ), out_i
 
 
@@ -693,19 +938,21 @@ def compute_bscan_texture_volumes_to_compact_zarr(
     lower_bound: np.ndarray,
     out_zarr_path: str | Path,
     z_step: int = 1,
-    # window: int = 31,   # kept for backwards compatibility, but texture_params.window is used
     step: int = 4,
     pad: int = 10,
-    families: tuple[str, ...] = ('firstorder', 'glcm', 'glrlm', 'glszm', 'gldm', 'ngtdm', 'lbp', 'gradient'),
+    families: tuple[str, ...] = (
+        'firstorder', 'heterogeneity', 'band_energy',
+        'glcm', 'glrlm', 'glszm', 'gldm', 'ngtdm', 'lbp', 'gradient'
+    ),
     include_wavelet: bool = False,
-    # levels: int = 32,   # kept for backwards compatibility, but texture_params.levels is used
     features_to_keep: tuple[str, ...] | None = None,
     n_jobs: int = 1,
     single_bscan_n_jobs: int = 1,
     texture_params: TextureSweepParams | None = None,
+    glcm_params: GLCMParams | None = None,
     overwrite: bool = True,
     chunks: tuple[int, int, int] | None = None,
-) -> Path:
+) -> Path:    
     """
     Memory-safe compact dense texture artifact.
 
@@ -714,6 +961,8 @@ def compute_bscan_texture_volumes_to_compact_zarr(
       - manifest in root attrs
     """
     texture_params = texture_params.concrete()
+    if glcm_params is None:
+        glcm_params = GLCMParams()
 
     vol = volume
     if getattr(vol, 'ndim', None) != 3:
@@ -749,6 +998,7 @@ def compute_bscan_texture_volumes_to_compact_zarr(
     print(f"done in {t2-t1} seconds")
 
     z0 = int(z_idx[0])
+
     _, first_maps, first_meta = _compute_one_bscan_texture_compact(
         z=z0,
         bscan=np.asarray(vol[z0], dtype=np.float32),
@@ -761,7 +1011,9 @@ def compute_bscan_texture_volumes_to_compact_zarr(
         features_to_keep=features_to_keep,
         n_jobs=single_bscan_n_jobs,
         band_clip_values=band_clip_values,
+        glcm_params=glcm_params,
     )
+
 
     feature_names = sorted(first_maps)
     if not feature_names:
@@ -800,6 +1052,12 @@ def compute_bscan_texture_volumes_to_compact_zarr(
                 k: [float(v[0]), float(v[1])]
                 for k, v in band_clip_values.items()
         },
+        glcm_params=dict(
+                distances=[int(x) for x in glcm_params.distances],
+                angles_deg=[float(x) for x in glcm_params.angles_deg],
+                aggregate_distances=bool(glcm_params.aggregate_distances),
+                aggregate_angles=bool(glcm_params.aggregate_angles),
+            ),
 
 
 
@@ -816,6 +1074,12 @@ def compute_bscan_texture_volumes_to_compact_zarr(
     root.attrs['band_clip_values_json'] = json.dumps(
         {k: [float(v[0]), float(v[1])] for k, v in band_clip_values.items()}
     )
+    root.attrs['glcm_params_json'] = json.dumps({
+            'distances': [int(x) for x in glcm_params.distances],
+            'angles_deg': [float(x) for x in glcm_params.angles_deg],
+            'aggregate_distances': bool(glcm_params.aggregate_distances),
+            'aggregate_angles': bool(glcm_params.aggregate_angles),
+        })
 
     for name, arr in first_maps.items():
         zarr_datasets[name][0, :, :] = arr.astype(np.float32, copy=False)
@@ -1052,7 +1316,6 @@ def _compute_global_texture_crop_bounds(
 
     return y_min, y_max
 
-
 def _compute_one_bscan_texture_compact(
     z: int,
     bscan: np.ndarray,
@@ -1065,6 +1328,7 @@ def _compute_one_bscan_texture_compact(
     features_to_keep: tuple[str, ...] | None = None,
     n_jobs: int = 1,
     band_clip_values: dict[str, tuple[float, float]] | None = None,
+    glcm_params: GLCMParams | None = None,
 ) -> tuple[int, dict[str, np.ndarray], DenseMapMeta]:
     """
     Compute sampled-grid feature maps on one fixed crop band.
@@ -1072,6 +1336,10 @@ def _compute_one_bscan_texture_compact(
     """
     crop = bscan[y_min:y_max]
     texture_params = texture_params.concrete()
+
+    if glcm_params is None:
+        glcm_params = GLCMParams()
+
     crop = preprocess_texture_image(crop, texture_params)
 
     maps, meta = compute_dense_texture_maps(
@@ -1084,6 +1352,7 @@ def _compute_one_bscan_texture_compact(
         levels=int(texture_params.levels),
         n_jobs=n_jobs,
         band_clip_values=band_clip_values,
+        glcm_params=glcm_params,
     )
 
     if features_to_keep is not None:
@@ -1091,7 +1360,6 @@ def _compute_one_bscan_texture_compact(
         maps = {k: v for k, v in maps.items() if k in keep}
 
     return z, maps, meta
-
 
 def compute_bscan_texture_volumes_to_compact_npz(
     volume: np.ndarray,
@@ -1339,73 +1607,6 @@ def instantiate_fullsize_texture_volumes_from_compact(
 
 
 
-def _compute_one_bscan_texture_fullres(
-        z: int,
-        bscan: np.ndarray,
-        upper: np.ndarray,
-        lower: np.ndarray,
-        step: int,
-        pad: int,
-        families: tuple[str, ...],
-        include_wavelet: bool,
-        texture_params: TextureSweepParams,
-        features_to_keep: tuple[str, ...] | None = None,
-        n_jobs: int = 1,
-    ) -> tuple[int, dict[str, np.ndarray]]:
-    """
-    Compute selected dense texture maps for one B-scan, then resample/scatter them
-    back into full (Y, X) image coordinates with NaN outside the processed crop.
-
-    I think really to get the best texture features we should pre-flatten (like for the horizontal and diagnoal runs, the horizontal structures will come out much better)
-    """
-    raise Exception( " i didn't think we used this fn anynore")
-    texture_params = texture_params.concrete()
-    y_min = int(np.floor(np.minimum(upper, lower).min() - pad - texture_params.window))
-    y_max = int(np.ceil(np.maximum(upper, lower).max() + pad + texture_params.window))
-    y_min = max(0, y_min)
-    y_max = min(bscan.shape[0], y_max)
-
-
-    crop = bscan[y_min:y_max]
-    crop = preprocess_texture_image(crop, texture_params)
-
-    maps, meta = compute_dense_texture_maps(
-        crop,
-        window=int(texture_params.window),
-        step=step,
-        mask=None,
-        families=families,
-        include_wavelet=include_wavelet,
-        levels=int(texture_params.levels),
-        n_jobs=n_jobs,
-    )
-
-    # crop = bscan[y_min:y_max]
-
-    # maps, meta = compute_dense_texture_maps(
-    #     crop,
-    #     window=window,
-    #     step=step,
-    #     mask=None,
-    #     families=families,
-    #     include_wavelet=include_wavelet,
-    #     levels=levels,
-    #     n_jobs=n_jobs,
-    # )
-
-    if features_to_keep is not None:
-        keep = set(features_to_keep)
-        maps = {k: v for k, v in maps.items() if k in keep}
-
-    full_maps = {}
-    for name, fmap in maps.items():
-        full_crop = resample_map_to_image(fmap, meta)
-        full_img = np.full(bscan.shape, np.nan, dtype=np.float32)
-        full_img[y_min:y_max, :] = full_crop.astype(np.float32, copy=False)
-        full_maps[name] = full_img
-
-    return z, full_maps
-
 
 def _open_texture_zarr_group(
     out_zarr_path: str | Path,
@@ -1470,275 +1671,9 @@ def _open_texture_zarr_group(
 
 
 
-def compute_bscan_texture_volumes_to_zarr(
-    volume: np.ndarray,
-    upper_bound: np.ndarray,
-    lower_bound: np.ndarray,
-    out_zarr_path: str | Path,
-    z_step: int = 1,
-    window: int = 31,
-    step: int = 4,
-    pad: int = 10,
-    families: tuple[str, ...] = ('firstorder', 'glcm', 'glrlm', 'glszm', 'gldm', 'ngtdm', 'lbp', 'gradient'),
-    include_wavelet: bool = False,
-    levels: int = 32,
-    texture_params: TextureSweepParams | None = None,
-    features_to_keep: tuple[str, ...] | None = None,
-    chunks: tuple[int, int, int] | None = None,
-    n_jobs: int = 1,
-    single_bscan_n_jobs: int = 1,
-    overwrite: bool = True,
-) -> Path:
-    """
-    Compute dense B-scan texture maps and stream them into a zarr group.
-
-    Output layout:
-        out_zarr_path/
-            raw__mean
-            raw__std
-            raw__glcm_contrast
-            ...
-
-    Each dataset has shape (Z, Y, X), with NaN for unsampled z slices when z_step > 1.
-    """
-
-    #for backwards compat
-    if texture_params is None:
-        texture_params = TextureSweepParams(
-            window=window,
-            levels=levels,
-            gaussian_sigma=0.0,
-            downsample_factor=1,
-        )
-    texture_params = texture_params.concrete()
-    
-    vol = np.asarray(volume)
-    if vol.ndim != 3:
-        raise ValueError('volume must be (Z, Y, X)')
-    if upper_bound.shape != (vol.shape[0], vol.shape[2]):
-        raise ValueError('upper_bound must have shape (Z, X)')
-    if lower_bound.shape != (vol.shape[0], vol.shape[2]):
-        raise ValueError('lower_bound must have shape (Z, X)')
-
-    z_idx = np.arange(0, vol.shape[0], z_step, dtype=int)
-    if len(z_idx) == 0:
-        raise ValueError('No z indices selected')
-
-    # REFACTOR can make faster, notable for small slice count
-    # Probe first slice to determine feature names before opening zarr datasets.
-    z0 = int(z_idx[0])
-    _, first_maps = _compute_one_bscan_texture_fullres(
-        z=z0,
-        bscan=vol[z0].astype(np.float32),
-        upper=upper_bound[z0].astype(np.float32),
-        lower=lower_bound[z0].astype(np.float32),
-        step=step,
-        pad=pad,
-        families=families,
-        include_wavelet=include_wavelet,
-        texture_params=texture_params,
-        features_to_keep=features_to_keep,
-        n_jobs=single_bscan_n_jobs,
-    )
-    feature_names = sorted(first_maps)
-    if not feature_names:
-        raise ValueError('No feature maps were produced')
-
-    root, zarr_datasets = _open_texture_zarr_group(
-        out_zarr_path=out_zarr_path,
-        volume_shape=vol.shape,
-        feature_names=feature_names,
-        chunks=chunks,
-        overwrite=overwrite,
-    )
-
-    root.attrs['z_step'] = int(z_step)
-    root.attrs['window'] = int(texture_params.window)
-    root.attrs['step'] = int(step)
-    root.attrs['pad'] = int(pad)
-    root.attrs['levels'] = int(texture_params.levels)
-    root.attrs['gaussian_sigma'] = float(texture_params.gaussian_sigma)
-    root.attrs['downsample_factor'] = int(texture_params.downsample_factor)
-    root.attrs['families'] = list(families)
-    root.attrs['include_wavelet'] = bool(include_wavelet)
-    root.attrs['features_to_keep'] = None if features_to_keep is None else list(features_to_keep)
-    root.attrs['texture_params'] = texture_params.as_attrs()
-
-    # Write the probe slice immediately.
-    for name, arr in first_maps.items():
-        zarr_datasets[name][z0, :, :] = arr
-
-    remaining_z = [int(z) for z in z_idx[1:]]
-
-    if n_jobs == 1:
-        for z in remaining_z:
-            _, maps = _compute_one_bscan_texture_fullres(
-                z=z,
-                bscan=vol[z].astype(np.float32),
-                upper=upper_bound[z].astype(np.float32),
-                lower=lower_bound[z].astype(np.float32),
-                step=step,
-                pad=pad,
-                families=families,
-                include_wavelet=include_wavelet,
-                texture_params=texture_params,
-                features_to_keep=features_to_keep,
-                n_jobs=single_bscan_n_jobs,
-            )
-            for name, arr in maps.items():
-                zarr_datasets[name][z, :, :] = arr
-    else:
-        with ProcessPoolExecutor(max_workers=n_jobs) as ex:
-            futures = [
-                ex.submit(
-                    _compute_one_bscan_texture_fullres,
-                    int(z),
-                    vol[z].astype(np.float32),
-                    upper_bound[z].astype(np.float32),
-                    lower_bound[z].astype(np.float32),
-                    step,
-                    pad,
-                    families,
-                    include_wavelet,
-                    texture_params,
-                    features_to_keep,
-                    single_bscan_n_jobs,
-                )
-                for z in remaining_z
-            ]
-
-            for fut in as_completed(futures):
-                z, maps = fut.result()
-                for name, arr in maps.items():
-                    zarr_datasets[name][z, :, :] = arr
-
-    zarr.consolidate_metadata(str(out_zarr_path))
-    return Path(out_zarr_path)
-
-
 # ---------- B-scan -> en-face ----------
 
-def _project_one_bscan(
-    z: int,
-    bscan: np.ndarray,
-    upper: np.ndarray,
-    lower: np.ndarray,
-    window: int,
-    step: int,
-    pad: int,
-    families: tuple[str, ...],
-    include_wavelet: bool,
-    levels: int,
-    feature_post_radius: int,
-    debug_plot: bool=False,
-) -> tuple[int, dict[str, np.ndarray]]:
-    y_min = int(np.floor(np.minimum(upper, lower).min() - pad - window))
-    y_max = int(np.ceil(np.maximum(upper, lower).max() + pad + window))
-    y_min = max(0, y_min)
-    y_max = min(bscan.shape[0], y_max)
-    crop = bscan[y_min:y_max]
 
-    maps, meta = compute_dense_texture_maps(
-        crop,
-        window=window,
-        step=step,
-        mask=None,
-        families=families,
-        include_wavelet=include_wavelet,
-        levels=levels,
-        n_jobs=1,
-    )
-
-    # AB = spu.ArrayBoard(skip = -debug_plot,plt_display=False,save_tag=f"bscan_demo")
-    # for map in maps:
-        # do the array board stuff here
-
-
-    # Nonsense!
-    # shadow_mask = estimate_shadow_mask_from_bscan(crop)
-    # shadow_grid = shadow_mask[np.ix_(meta.row_centers, meta.col_centers)]
-    # maps = postprocess_feature_dict(maps, vessel_mask=shadow_grid, radius=feature_post_radius)
-
-    y_grid = meta.row_centers + y_min
-    x_grid = meta.col_centers
-    vecs = {}
-    for name, fmap in maps.items():
-        sampled = np.full(len(x_grid), np.nan, dtype=np.float32)
-        for j, x in enumerate(x_grid):
-            lo = min(upper[x], lower[x]) - pad
-            hi = max(upper[x], lower[x]) + pad
-            keep = (y_grid >= lo) & (y_grid <= hi)
-            if keep.any():
-                sampled[j] = np.nanmean(fmap[keep, j]) # This is very opnioninaed taking the mean only
-        full = np.full(bscan.shape[1], np.nan, dtype=np.float32)
-        good = np.isfinite(sampled)
-        if good.sum() >= 2:
-            full[:] = np.interp(np.arange(bscan.shape[1]), x_grid[good], sampled[good])
-        vecs[name] = full
-    return z, vecs
-
-
-def project_bscan_texture_to_enface(
-    volume: np.ndarray,
-    upper_bound: np.ndarray,
-    lower_bound: np.ndarray,
-    z_step: int = 1,
-    window: int = 31,
-    step: int = 4,
-    pad: int = 10,
-    families: tuple[str, ...] = ('firstorder', 'glcm', 'glrlm', 'glszm', 'gldm', 'ngtdm', 'lbp', 'gradient'),
-    include_wavelet: bool = False,
-    levels: int = 32,
-    feature_post_radius: int = 3,
-    n_jobs: int = 1,
-) -> dict[str, np.ndarray]:
-    """
-    likely not going to be used -- we will instead have the bscan texture zarrs and use some of the below functions.
-    Compute texture in each B-scan, then collapse vertically inside the ROI to build en-face feature maps.
-
-    upper_bound and lower_bound should be (Z, X) arrays.
-    """
-    vol = np.asarray(volume)
-    if vol.ndim != 3:
-        raise ValueError('volume must be (Z, Y, X)')
-    z_idx = np.arange(0, vol.shape[0], z_step)
-    worker = delayed(_project_one_bscan)
-    out = Parallel(n_jobs=n_jobs, prefer='processes')(
-        worker(
-            int(z),
-            vol[z].astype(np.float32),
-            upper_bound[z].astype(np.float32),
-            lower_bound[z].astype(np.float32),
-            window,
-            step,
-            pad,
-            families,
-            include_wavelet,
-            levels,
-            feature_post_radius,
-        )
-        for z in z_idx
-    )
-
-    feature_names = sorted({k for _, d in out for k in d})
-    enface = {name: np.full((vol.shape[0], vol.shape[2]), np.nan, dtype=np.float32) for name in feature_names}
-    for z, vecs in out:
-        for name, vec in vecs.items():
-            enface[name][z] = vec
-
-    if z_step > 1:
-        filled = {}
-        src_z = z_idx.astype(float)
-        full_z = np.arange(vol.shape[0], dtype=float)
-        for name, arr in enface.items():
-            out_arr = arr.copy()
-            for x in range(arr.shape[1]):
-                good = np.isfinite(arr[z_idx, x])
-                if good.sum() >= 2:
-                    out_arr[:, x] = np.interp(full_z, src_z[good], arr[z_idx[good], x])
-            filled[name] = out_arr
-        enface = filled
-    return enface
 
 
 def project_texture_zarr_to_enface_for_volume(

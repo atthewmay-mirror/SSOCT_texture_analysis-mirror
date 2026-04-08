@@ -54,6 +54,8 @@ def expand_input_tokens(tokens: list[str]) -> list[str]:
         raise FileNotFoundError(f"No input volumes found from: {tokens}")
     return out
 
+# DEFAULT_FAMILIES = (
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -65,10 +67,12 @@ def main():
     ap.add_argument("--overwrite_flatten", action="store_true")
     ap.add_argument("--include_full_retina", action="store_true")
 
-    ap.add_argument("--texture_window", type=int, default=11)
+    ap.add_argument("--texture_windows", type=int, default=[31])
     ap.add_argument("--texture_step", type=int, default=4)
     ap.add_argument("--texture_levels", type=int, default=16)
     ap.add_argument("--texture_n_jobs", type=int, default=20)
+    # ap.add_argument("--texture_enface_families", nargs="+", default = [ 'firstorder', 'heterogeneity', 'band_energy', 'glcm', 'gradient',])
+    ap.add_argument("--texture_enface_families", nargs="+", default = [ 'firstorder', 'heterogeneity', 'band_energy', 'glcm', 'gradient', 'glrlm', 'glszm', 'gldm', 'ngtdm', 'lbp', ])
 
     ap.add_argument("--texture_root_dir", type=str, default=None)
     ap.add_argument("--texture_run", type=str, default=None)
