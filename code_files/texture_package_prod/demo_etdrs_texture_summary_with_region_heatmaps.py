@@ -593,6 +593,8 @@ def process_case(
     extra_radii: tuple[float, ...],
     show_features: list[str],
     max_panels_per_page: int = 60,
+    save_mosaic=True,
+    save_summaries=True,
 ):
     maps = load_enface_maps(enface_path)
     first_map = next(iter(maps.values()))
@@ -652,20 +654,21 @@ def process_case(
     masks = add_sectorized_ring_masks(masks, fovea_xy=fovea_std_xy)
     masks = apply_exclusion_to_masks(masks, exclusion_std)
     # Save overlay mosaic.
-    overlay_dir = out_dir / "overlays"
-    overlay_dir.mkdir(parents=True, exist_ok=True)
-    
-    save_overlay_mosaic_pdf(
-        overlay_dir / f"{case_id}__overlay.pdf",
-        case_id=case_id,
-        transformed_maps=transformed_maps,
-        show_features=show_features,
-        fovea_xy=fovea_std_xy,
-        radii=radii,
-        extra_radii=extra_radii,
-        exclusion_mask=exclusion_std,
-        max_panels_per_page=max_panels_per_page,
-    )
+    if save_mosaic:
+        overlay_dir = out_dir / "overlays"
+        overlay_dir.mkdir(parents=True, exist_ok=True)
+        
+        save_overlay_mosaic_pdf(
+            overlay_dir / f"{case_id}__overlay.pdf",
+            case_id=case_id,
+            transformed_maps=transformed_maps,
+            show_features=show_features,
+            fovea_xy=fovea_std_xy,
+            radii=radii,
+            extra_radii=extra_radii,
+            exclusion_mask=exclusion_std,
+            max_panels_per_page=max_panels_per_page,
+        )
     # Summaries.
     rows = []
     extra_ring_names = [f"extra_ring_{i}" for i in range(1, len(extra_radii) + 1)]
@@ -682,7 +685,7 @@ def process_case(
                 "stat": "mean",
                 "value": value,
             })
-        if feature_name in show_features:
+        if feature_name in show_features and save_summaries:
             save_summary_plots(
                 summary_plot_dir,
                 case_id=case_id,
