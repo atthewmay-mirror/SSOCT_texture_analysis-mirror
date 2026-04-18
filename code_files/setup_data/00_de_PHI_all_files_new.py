@@ -16,7 +16,8 @@ def load_master_mapping(master_csv):
     """
     mrn_to_id = {}
     max_id = 0
-    with open(master_csv, "r", newline="") as f:
+    # with open(master_csv, "r", newline="") as f:
+    with open(master_csv, "r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         # Expect at least: integer_id, MRN
         for row in reader:

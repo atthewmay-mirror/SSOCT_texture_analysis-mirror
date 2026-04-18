@@ -37,8 +37,11 @@ DEFAULT_FAMILIES = (
     'heterogeneity',
     'band_energy',
     'glcm',
+    'glrlm', 'glszm', 'gldm', 'ngtdm', 'lbp', 
     'gradient',
 )
+
+
 
 DEFAULT_GLCM_PARAMS = GLCMParams(
     distances=(1,),
