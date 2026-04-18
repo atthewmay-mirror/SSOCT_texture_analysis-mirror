@@ -579,5 +579,5 @@ RPE_STEPS_unified_3_19_26: List[ssf.RPEStepFn] = [ # Exploring the addition of a
     ssf.step_rpe_highres_DP_two_layer_EZ,
     ssf.step_rpe_highres_unsmooth,    # ssf.step_ilm_unsmooth,overwrite=True,save_by_ID=True),
     ssf.step_rpe_vertical_shift_refine, # repeat and save teh computation
-    ssf.step_rpe_choroidal_EZ_endpoint_plot,
+    # ssf.step_rpe_choroidal_EZ_endpoint_plot,
 ]
