@@ -53,3 +53,7 @@ for subd_name, feats in sorted(feature_sets.items()):
         print(f"\n{subd_name}")
         for feat in missing:
             print(f"  {feat}")
+    if not missing:
+        print(f"\n{subd_name} has all features!")
+        for feat in all_features:
+            print(f"  {feat}")
