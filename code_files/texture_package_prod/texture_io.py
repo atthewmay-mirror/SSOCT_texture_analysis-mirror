@@ -96,3 +96,5 @@ def to_gray(image: np.ndarray, prefer_green: bool = False) -> np.ndarray:
     if prefer_green and image.shape[2] >= 3:
         return image[..., 1].astype(np.float32)
     return image[..., :3].astype(np.float32).mean(axis=2)
+
+

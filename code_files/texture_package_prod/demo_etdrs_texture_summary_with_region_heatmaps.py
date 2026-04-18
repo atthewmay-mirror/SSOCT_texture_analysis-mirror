@@ -81,7 +81,7 @@ def discover_cases(enface_root: Path, glob_pat: str) -> list[tuple[str, Path]]:
     # Prefer explicit .npz files at top level.
     for p in sorted(enface_root.glob(glob_pat)):
         if p.is_file() and p.suffix == ".npz":
-            cases.append((canonical_case_id(p.stem), p))
+            cases.append((canonical_case_id(p.parts[-2]), p))
     if cases:
         return cases
 
@@ -416,6 +416,7 @@ def save_overlay_mosaic_pdf(
 ):
     names = [f for f in show_features if f in transformed_maps]
     if not names:
+        print("No matching names discovered")
         names = list(transformed_maps)[:6]
 
     n_pages = int(np.ceil(len(names) / max_panels_per_page))

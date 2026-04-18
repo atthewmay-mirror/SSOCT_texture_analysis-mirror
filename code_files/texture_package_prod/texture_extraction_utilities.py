@@ -1089,7 +1089,7 @@ def compute_bscan_texture_volumes_to_compact_zarr(
     if n_jobs == 1:
         for out_i, z in remaining:
             _, maps, _ = _compute_one_bscan_texture_compact(
-                z=z0,
+                z=z,
                 bscan=np.asarray(vol[z], dtype=np.float32),
                 y_min=y_min,
                 y_max=y_max,
@@ -1100,6 +1100,7 @@ def compute_bscan_texture_volumes_to_compact_zarr(
                 features_to_keep=features_to_keep,
                 n_jobs=single_bscan_n_jobs,
                 band_clip_values=band_clip_values,
+                glcm_params=glcm_params,
             )
 
 
@@ -1129,6 +1130,7 @@ def compute_bscan_texture_volumes_to_compact_zarr(
                     features_to_keep=features_to_keep,
                     single_bscan_n_jobs=single_bscan_n_jobs,
                     band_clip_values=band_clip_values,
+                    glcm_params=glcm_params,
                 )
                 pending[fut] = out_i
 
@@ -1159,6 +1161,8 @@ def compute_bscan_texture_volumes_to_compact_zarr(
                         texture_params=texture_params,
                         features_to_keep=features_to_keep,
                         single_bscan_n_jobs=single_bscan_n_jobs,
+                        band_clip_values=band_clip_values,
+                        glcm_params=glcm_params,
                     )
                     pending[next_fut] = next_out_i
 
