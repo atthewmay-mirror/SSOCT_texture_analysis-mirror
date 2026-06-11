@@ -1,0 +1,1769 @@
+
+#REVIEWED!
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import partial
+from itertools import product
+import json
+import numpy as np
+from joblib import Parallel, delayed
+from scipy import ndimage
+from scipy.stats import entropy as scipy_entropy
+from skimage.feature import graycomatrix, graycoprops, local_binary_pattern
+from skimage.transform import resize
+from skimage.measure import label as cc_label
+import code_files.segmentation_code.segmentation_plot_utils as spu
+
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from pathlib import Path
+
+import numcodecs
+import zarr
+import time
+
+# from .vessel_texture_postproc_utils import estimate_shadow_mask_from_bscan, postprocess_feature_dict
+
+
+@dataclass
+class DenseMapMeta:
+    row_centers: np.ndarray
+    col_centers: np.ndarray
+    window: int
+    step: int
+    image_shape: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class GLCMParams:
+    distances: tuple[int, ...] = (1,)
+    angles_deg: tuple[float, ...] = (0.0, 45.0, 90.0, 135.0)
+    aggregate_distances: bool = False
+    aggregate_angles: bool = True
+
+    def angles_rad(self) -> tuple[float, ...]:
+        return tuple(np.deg2rad(a) for a in self.angles_deg)
+
+@dataclass(frozen=True)
+class TextureSweepParams:
+    """
+    Same class used for:
+      1. the public sweep definition (fields can be tuples/lists)
+      2. the concrete single-run params passed into engine + per-B-scan worker
+    """
+    window: int | tuple[int, ...] = 31
+    levels: int | tuple[int, ...] = 32
+    gaussian_sigma: float | tuple[float, ...] = 0.0
+    downsample_factor: int | tuple[int, ...] = 1
+
+    @staticmethod
+    def _to_tuple(value):
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+        if isinstance(value, (list, tuple)):
+            return tuple(value)
+        return (value,)
+
+    def iter_cases(self):
+        windows = tuple(int(v) for v in self._to_tuple(self.window))
+        levels = tuple(int(v) for v in self._to_tuple(self.levels))
+        sigmas = tuple(float(v) for v in self._to_tuple(self.gaussian_sigma))
+        downs = tuple(int(v) for v in self._to_tuple(self.downsample_factor))
+
+        for window, levels, gaussian_sigma, downsample_factor in product(
+            windows, levels, sigmas, downs
+        ):
+            yield TextureSweepParams(
+                window=window,
+                levels=levels,
+                gaussian_sigma=gaussian_sigma,
+                downsample_factor=downsample_factor,
+            )
+
+    def concrete(self) -> "TextureSweepParams":
+        cases = list(self.iter_cases())
+        if len(cases) != 1:
+            raise ValueError(
+                "TextureSweepParams must be concrete here. "
+                "Pass a single case, not a sweep."
+            )
+        return cases[0]
+
+    def tag(self) -> str:
+        p = self.concrete()
+        return (
+            f"window={int(p.window)}__"
+            f"levels={int(p.levels)}__"
+            f"gaussian={float(p.gaussian_sigma):g}__"
+            f"downsample={int(p.downsample_factor)}"
+        )
+
+    def as_attrs(self) -> dict:
+        p = self.concrete()
+        return {
+            "window": int(p.window),
+            "levels": int(p.levels),
+            "gaussian_sigma": float(p.gaussian_sigma),
+            "downsample_factor": int(p.downsample_factor),
+        }
+
+
+def preprocess_texture_image(
+    image: np.ndarray,
+    texture_params: TextureSweepParams,
+) -> np.ndarray:
+    """
+    Apply Gaussian smoothing and optional downsample->upsample interpolation
+    before texture extraction. Output remains same shape as input.
+    """
+    p = texture_params.concrete()
+    img = np.asarray(image, dtype=np.float32)
+
+    if float(p.gaussian_sigma) > 0:
+        img = ndimage.gaussian_filter(img, sigma=float(p.gaussian_sigma))
+
+    ds = int(p.downsample_factor)
+    if ds > 1:
+        small_shape = (
+            max(1, int(np.round(img.shape[0] / ds))),
+            max(1, int(np.round(img.shape[1] / ds))),
+        )
+
+        img_small = resize(
+            img,
+            small_shape,
+            order=1,
+            preserve_range=True,
+            anti_aliasing=True,
+        ).astype(np.float32, copy=False)
+
+        img = resize(
+            img_small,
+            img.shape,
+            order=1,
+            preserve_range=True,
+            anti_aliasing=False,
+        ).astype(np.float32, copy=False)
+
+    return img.astype(np.float32, copy=False)
+
+GLCM_FEATURES = ('contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation', 'ASM')
+
+
+def robust_rescale_uint(
+    image: np.ndarray,
+    levels: int = 32,
+    clip_percentiles: tuple[float, float] = (1, 99),
+    clip_values: tuple[float, float] | None = None,
+) -> np.ndarray:
+    """
+    Rescale to integer gray levels.
+    If clip_values is provided, use those fixed (lo, hi) values instead of
+    recomputing percentiles on this image.
+    """
+    img = image.astype(np.float32, copy=False)
+
+    if clip_values is None:
+        lo, hi = np.nanpercentile(img, clip_percentiles)
+    else:
+        lo, hi = clip_values
+
+    img = np.clip(img, lo, hi)
+    if hi <= lo:
+        return np.zeros_like(img, dtype=np.uint8)
+
+    img = (img - lo) / (hi - lo)
+    return np.clip(np.round(img * (levels - 1)), 0, levels - 1).astype(np.uint8)
+
+
+
+def compute_volume_level_band_clip_values(
+    volume,
+    y_min: int,
+    y_max: int,
+    texture_params: TextureSweepParams,
+    include_wavelet: bool,
+    clip_percentiles: tuple[float, float] = (1, 99),
+    sample_z_step: int = 1,
+    sample_xy_step: int = 1,
+) -> dict[str, tuple[float, float]]:
+    """
+    Compute one robust (lo, hi) pair per band for the whole volume.
+
+    Uses a subsample for memory safety. This is still volume-level, just not
+    every pixel. Set sample_z_step=1 and sample_xy_step=1 if you want exact.
+    """
+    texture_params = texture_params.concrete()
+    z_idx = np.arange(0, volume.shape[0], sample_z_step, dtype=int)
+
+    band_samples: dict[str, list[np.ndarray]] = {}
+
+    for z in z_idx:
+        crop = np.asarray(volume[z, y_min:y_max, :], dtype=np.float32)
+        crop = preprocess_texture_image(crop, texture_params)
+
+        bands = haar_like_bands(crop) if include_wavelet else {'raw': crop}
+
+        for band_name, arr in bands.items():
+            samp = np.asarray(arr[::sample_xy_step, ::sample_xy_step], dtype=np.float32).ravel()
+            samp = samp[np.isfinite(samp)]
+            if samp.size == 0:
+                continue
+            band_samples.setdefault(band_name, []).append(samp)
+
+    out = {}
+    for band_name, pieces in band_samples.items():
+        vals = np.concatenate(pieces)
+        lo, hi = np.nanpercentile(vals, clip_percentiles)
+        out[band_name] = (float(lo), float(hi))
+
+    return out
+
+# ---------- small patch features ----------
+
+def _nanmean_std_percentiles(values: np.ndarray, bins: int = 32) -> dict[str, float]:
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {
+            'mean': np.nan,
+            'std': np.nan,
+            'entropy': np.nan,
+            'p10': np.nan,
+            'p50': np.nan,
+            'p90': np.nan,
+        }
+    hist, _ = np.histogram(values, bins=int(bins))
+    probs = hist / max(hist.sum(), 1)
+    return {
+        'mean': float(np.nanmean(values)),
+        'std': float(np.nanstd(values)),
+        'entropy': float(scipy_entropy(probs + 1e-12, base=2)),
+        'p10': float(np.nanpercentile(values, 10)),
+        'p50': float(np.nanpercentile(values, 50)),
+        'p90': float(np.nanpercentile(values, 90)),
+    }
+
+
+def glcm_features_patch(
+    patch_q: np.ndarray,
+    levels: int = 32,
+    glcm_params: GLCMParams | None = None,
+) -> dict[str, float]:
+    """
+    Flexible GLCM extraction.
+
+    If aggregate_distances=False and aggregate_angles=True:
+        returns separate distance-specific features, e.g.
+            glcm_d1_contrast, glcm_d3_contrast, ...
+
+    If aggregate_distances=True and aggregate_angles=True:
+        returns pooled features, e.g.
+            glcm_contrast, glcm_entropy, ...
+    """
+    if glcm_params is None:
+        glcm_params = GLCMParams()
+
+    distances = tuple(int(d) for d in glcm_params.distances)
+    angles_rad = tuple(float(a) for a in glcm_params.angles_rad())
+
+    glcm = graycomatrix(
+        patch_q,
+        distances=list(distances),
+        angles=list(angles_rad),
+        levels=levels,
+        symmetric=True,
+        normed=True,
+    )
+
+    out = {}
+
+    if glcm_params.aggregate_distances and glcm_params.aggregate_angles:
+        for name in GLCM_FEATURES:
+            out[f'glcm_{name}'] = float(graycoprops(glcm, name).mean())
+
+        p = glcm.astype(np.float64, copy=False)
+        out['glcm_entropy'] = float((-(p * np.log2(p + 1e-12))).sum(axis=(0, 1)).mean())
+        return out
+
+    if (not glcm_params.aggregate_distances) and glcm_params.aggregate_angles:
+        for di, d in enumerate(distances):
+            for name in GLCM_FEATURES:
+                vals = graycoprops(glcm, name)[di, :]
+                out[f'glcm_d{int(d)}_{name}'] = float(np.nanmean(vals))
+
+        p = glcm.astype(np.float64, copy=False)
+        ent = (-(p * np.log2(p + 1e-12))).sum(axis=(0, 1))  # (D, A)
+        for di, d in enumerate(distances):
+            out[f'glcm_d{int(d)}_entropy'] = float(np.nanmean(ent[di, :]))
+        return out
+
+    for di, d in enumerate(distances):
+        for ai, ang_deg in enumerate(glcm_params.angles_deg):
+            ang_tag = int(round(float(ang_deg))) % 180
+            for name in GLCM_FEATURES:
+                vals = graycoprops(glcm, name)
+                out[f'glcm_d{int(d)}_a{ang_tag}_{name}'] = float(vals[di, ai])
+
+        p = glcm.astype(np.float64, copy=False)
+        ent = (-(p * np.log2(p + 1e-12))).sum(axis=(0, 1))
+        for ai, ang_deg in enumerate(glcm_params.angles_deg):
+            ang_tag = int(round(float(ang_deg))) % 180
+            out[f'glcm_d{int(d)}_a{ang_tag}_entropy'] = float(ent[di, ai])
+
+    return out
+
+
+def _iter_lines(q: np.ndarray, angle: int):
+    if angle == 0:
+        for row in q:
+            yield row
+    elif angle == 90:
+        for col in q.T:
+            yield col
+    elif angle == 45:
+        for k in range(-q.shape[0] + 1, q.shape[1]):
+            yield np.diagonal(np.fliplr(q), offset=k)
+    elif angle == 135:
+        for k in range(-q.shape[0] + 1, q.shape[1]):
+            yield np.diagonal(q, offset=k)
+    else:
+        raise ValueError(angle)
+
+
+def _run_length_matrix(q: np.ndarray, levels: int = 32, angles: tuple[int, ...] = (0, 45, 90, 135)) -> np.ndarray:
+    """This function builds a GLRLM: a gray-level run-length matrix.
+
+    What that means:
+
+    rows = gray level
+    columns = run length
+    entry (g, r) = how many times you saw a run of gray level g with length r+1
+
+    A “run” means consecutive equal-valued pixels along some direction."""
+    max_run = max(q.shape)
+    mats = []
+    for angle in angles:
+        mat = np.zeros((levels, max_run), dtype=np.float64)
+        for line in _iter_lines(q, angle):
+            if line.size == 0:
+                continue
+            start = 0
+            for i in range(1, len(line) + 1):
+                if i == len(line) or line[i] != line[start]:
+                    gray = int(line[start])
+                    run = i - start
+                    mat[gray, run - 1] += 1
+                    start = i
+        mats.append(mat)
+    return np.mean(mats, axis=0)
+
+
+def glrlm_features_patch(patch_q: np.ndarray, levels: int = 32) -> dict[str, float]:
+    p = _run_length_matrix(patch_q, levels=levels)
+    total = p.sum()
+    if total == 0:
+        return {k: np.nan for k in ('glrlm_sre', 'glrlm_lre', 'glrlm_gln', 'glrlm_rln', 'glrlm_rp')}
+    runs = np.arange(1, p.shape[1] + 1)[None, :]
+    gray_sums = p.sum(axis=1)
+    run_sums = p.sum(axis=0)
+    return {
+        'glrlm_sre': float((p / (runs * runs)).sum() / total),
+        'glrlm_lre': float((p * (runs * runs)).sum() / total),
+        'glrlm_gln': float((gray_sums * gray_sums).sum() / total),
+        'glrlm_rln': float((run_sums * run_sums).sum() / total),
+        'glrlm_rp': float(total / patch_q.size),
+    }
+
+
+def glszm_features_patch(patch_q: np.ndarray, levels: int = 32) -> dict[str, float]:
+    max_zone = patch_q.size
+    p = np.zeros((levels, max_zone), dtype=np.float64)
+    for gray in np.unique(patch_q):
+        cc = cc_label(patch_q == gray, connectivity=2)
+        if cc.max() == 0:
+            continue
+        sizes = np.bincount(cc.ravel())[1:]
+        for s in sizes:
+            p[int(gray), s - 1] += 1
+    total = p.sum()
+    if total == 0:
+        return {k: np.nan for k in ('glszm_sze', 'glszm_lze', 'glszm_gln', 'glszm_zsn')}
+    zones = np.arange(1, p.shape[1] + 1)[None, :]
+    return {
+        'glszm_sze': float((p / (zones * zones)).sum() / total),
+        'glszm_lze': float((p * (zones * zones)).sum() / total),
+        'glszm_gln': float(((p.sum(axis=1) ** 2).sum()) / total),
+        'glszm_zsn': float(((p.sum(axis=0) ** 2).sum()) / total),
+    }
+
+
+def gldm_features_patch(patch_q: np.ndarray, levels: int = 32, delta: int = 1) -> dict[str, float]:
+    pad = np.pad(patch_q, 1, mode='edge')
+    dep = np.zeros_like(patch_q, dtype=np.int32)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            nei = pad[1 + dr:1 + dr + patch_q.shape[0], 1 + dc:1 + dc + patch_q.shape[1]]
+            dep += (np.abs(nei.astype(int) - patch_q.astype(int)) <= delta)
+    dep += 1
+    max_dep = dep.max()
+    p = np.zeros((levels, max_dep), dtype=np.float64)
+    for g in range(levels):
+        m = patch_q == g
+        if m.any():
+            counts = np.bincount(dep[m], minlength=max_dep + 1)[1:]
+            p[g, :len(counts)] += counts
+    total = p.sum()
+    if total == 0:
+        return {k: np.nan for k in ('gldm_sde', 'gldm_lde', 'gldm_gln', 'gldm_dnu')}
+    deps = np.arange(1, p.shape[1] + 1)[None, :]
+    return {
+        'gldm_sde': float((p / (deps * deps)).sum() / total),
+        'gldm_lde': float((p * (deps * deps)).sum() / total),
+        'gldm_gln': float(((p.sum(axis=1) ** 2).sum()) / total),
+        'gldm_dnu': float(((p.sum(axis=0) ** 2).sum()) / total),
+    }
+
+
+def ngtdm_features_patch(patch_q: np.ndarray, levels: int = 32) -> dict[str, float]:
+    q = patch_q.astype(np.float32)
+    k = 3
+    neigh_sum = ndimage.uniform_filter(q, size=k, mode='nearest') * (k * k)
+    neigh_mean = (neigh_sum - q) / (k * k - 1)
+    s = np.zeros(levels, dtype=np.float64)
+    n = np.zeros(levels, dtype=np.float64)
+    for g in range(levels):
+        m = patch_q == g
+        if m.any():
+            s[g] = np.abs(q[m] - neigh_mean[m]).sum()
+            n[g] = m.sum()
+    N = n.sum()
+    if N == 0:
+        return {k: np.nan for k in ('ngtdm_coarseness', 'ngtdm_contrast', 'ngtdm_busyness', 'ngtdm_complexity', 'ngtdm_strength')}
+    p = n / N # proportion at each gray level in n
+    gs = np.arange(levels, dtype=np.float64)
+    ii, jj = np.meshgrid(gs, gs, indexing='ij')
+    pi, pj = np.meshgrid(p, p, indexing='ij')
+    diff = np.abs(ii - jj)
+    ng = max(int((n > 0).sum()), 1)
+    coarseness = 1.0 / max((p * s).sum(), 1e-8) # higher is smoother
+    contrast = (pi * pj * diff * diff).sum() * s.sum() / max(ng * (ng - 1) * N, 1e-8)
+    busyness = (p * s).sum() / max(np.abs((gs[:, None] * pi) - (gs[None, :] * pj)).sum(), 1e-8)
+    complexity = (diff * (pi * s[:, None] + pj * s[None, :]) / (pi + pj + 1e-8)).sum() / max(N, 1e-8)
+    strength = ((pi + pj) * diff * diff).sum() / max(s.sum(), 1e-8)
+    return {
+        'ngtdm_coarseness': float(coarseness),
+        'ngtdm_contrast': float(contrast),
+        'ngtdm_busyness': float(busyness),
+        'ngtdm_complexity': float(complexity),
+        'ngtdm_strength': float(strength),
+    }
+
+def lbp_features_patch(patch: np.ndarray, levels: int = 32) -> dict[str, float]:
+    patch_u = robust_rescale_uint(patch, levels=int(levels))
+    lbp = local_binary_pattern(patch_u, P=8, R=1, method='uniform')
+    hist, _ = np.histogram(lbp, bins=np.arange(12), density=True)
+    return {
+        'lbp_mean': float(lbp.mean()),
+        'lbp_std': float(lbp.std()),
+        'lbp_entropy': float(scipy_entropy(hist + 1e-12, base=2)),
+        'lbp_uniformity': float((hist * hist).sum()),
+    }
+
+
+def gradient_orientation_features_patch(patch: np.ndarray) -> dict[str, float]:
+    gx = ndimage.sobel(patch, axis=1)
+    gy = ndimage.sobel(patch, axis=0)
+    mag = np.hypot(gx, gy)
+    jxx = ndimage.gaussian_filter(gx * gx, 1.0).mean()
+    jyy = ndimage.gaussian_filter(gy * gy, 1.0).mean()
+    jxy = ndimage.gaussian_filter(gx * gy, 1.0).mean()
+    tr = jxx + jyy
+    det = (jxx - jyy) ** 2 + 4 * jxy * jxy
+    lam1 = 0.5 * (tr + np.sqrt(max(det, 0.0)))
+    lam2 = 0.5 * (tr - np.sqrt(max(det, 0.0)))
+    coherence = (lam1 - lam2) / max(lam1 + lam2, 1e-8)
+    return {
+        'grad_mean': float(mag.mean()),
+        'grad_std': float(mag.std()),
+        'orientation_coherence': float(coherence),
+    }
+
+
+def _safe_entropy_from_uint(values_q: np.ndarray, levels: int) -> float:
+    hist = np.bincount(values_q.ravel(), minlength=int(levels)).astype(np.float64)
+    hist_sum = hist.sum()
+    if hist_sum <= 0:
+        return np.nan
+    probs = hist / hist_sum
+    return float(scipy_entropy(probs + 1e-12, base=2))
+
+
+def _finite_patch_values(patch: np.ndarray) -> np.ndarray:
+    vals = np.asarray(patch, dtype=np.float32)
+    vals = vals[np.isfinite(vals)]
+    return vals
+
+
+def heterogeneity_features_patch(
+    patch: np.ndarray,
+    levels: int = 32,
+    centered_clip_percentile: float = 95.0,
+) -> dict[str, float]:
+    """
+    Patch-level heterogeneity features intended to reflect roughness / stipple /
+    spread more than absolute brightness.
+
+    Returns:
+        hetero_std
+        hetero_mad
+        hetero_iqr
+        hetero_entropy_centered
+    """
+    vals = _finite_patch_values(patch)
+    if vals.size == 0:
+        return {
+            'hetero_std': np.nan,
+            'hetero_mad': np.nan,
+            'hetero_iqr': np.nan,
+            'hetero_entropy_centered': np.nan,
+        }
+
+    med = float(np.nanmedian(vals))
+    centered = vals - med
+
+    std = float(np.nanstd(vals))
+    mad = float(np.nanmedian(np.abs(centered)))
+    q25, q75 = np.nanpercentile(vals, [25, 75])
+    iqr = float(q75 - q25)
+
+    scale = float(np.nanpercentile(np.abs(centered), centered_clip_percentile))
+    if (not np.isfinite(scale)) or scale <= 0:
+        ent_centered = 0.0
+    else:
+        centered_q = np.clip(
+            np.round(((centered / scale) + 1.0) * 0.5 * (levels - 1)),
+            0,
+            levels - 1,
+        ).astype(np.uint8)
+        ent_centered = _safe_entropy_from_uint(centered_q, levels=levels)
+
+    return {
+        'hetero_std': std,
+        'hetero_mad': mad,
+        'hetero_iqr': iqr,
+        'hetero_entropy_centered': ent_centered,
+    }
+
+
+def _rms_energy(arr: np.ndarray) -> float:
+    arr = np.asarray(arr, dtype=np.float32)
+    good = np.isfinite(arr)
+    if not good.any():
+        return np.nan
+    x = arr[good]
+    return float(np.sqrt(np.mean(x * x)))
+
+
+def band_energy_features_patch(
+    patch: np.ndarray,
+    sigma_base_frac: float = 1 / 16,
+) -> dict[str, float]:
+    """
+    Multi-scale band-energy summary.
+
+    fine   = original - mildly blurred
+    medium = mild blur - stronger blur
+    coarse = stronger blur - strongest blur
+
+    Intended to separate:
+        - fine stipple / islands
+        - medium patchiness
+        - coarse mottling / broad zones
+
+    Returns:
+        band_fine_energy
+        band_medium_energy
+        band_coarse_energy
+        band_fine_to_coarse
+        band_fine_frac
+        band_coarse_frac
+    """
+    p = np.asarray(patch, dtype=np.float32)
+    good = np.isfinite(p)
+    if not good.any():
+        return {
+            'band_fine_energy': np.nan,
+            'band_medium_energy': np.nan,
+            'band_coarse_energy': np.nan,
+            'band_fine_to_coarse': np.nan,
+            'band_fine_frac': np.nan,
+            'band_coarse_frac': np.nan,
+        }
+
+    fill = float(np.nanmedian(p[good]))
+    p = np.where(np.isfinite(p), p, fill)
+
+    # Remove patch baseline so this is more about texture structure than brightness
+    p = p - float(np.nanmedian(p))
+
+    base_sigma = max(1.0, float(min(p.shape)) * float(sigma_base_frac))
+
+    g1 = ndimage.gaussian_filter(p, sigma=base_sigma, mode='nearest')
+    g2 = ndimage.gaussian_filter(p, sigma=base_sigma * 2.0, mode='nearest')
+    g3 = ndimage.gaussian_filter(p, sigma=base_sigma * 4.0, mode='nearest')
+
+    fine = p - g1
+    medium = g1 - g2
+    coarse = g2 - g3
+
+    e_fine = _rms_energy(fine)
+    e_medium = _rms_energy(medium)
+    e_coarse = _rms_energy(coarse)
+
+    total = max(e_fine + e_medium + e_coarse, 1e-8)
+
+    return {
+        'band_fine_energy': e_fine,
+        'band_medium_energy': e_medium,
+        'band_coarse_energy': e_coarse,
+        'band_fine_to_coarse': float(e_fine / max(e_coarse, 1e-8)),
+        'band_fine_frac': float(e_fine / total),
+        'band_coarse_frac': float(e_coarse / total),
+    }
+
+# ---------- filters ----------
+
+def haar_like_bands(image: np.ndarray) -> dict[str, np.ndarray]:
+    """Full-resolution Haar-like bands using separable low/high kernels."""
+    img = image.astype(np.float32)
+    low = np.array([0.5, 0.5], dtype=np.float32)
+    high = np.array([0.5, -0.5], dtype=np.float32)
+
+    def sep(k0, k1):
+        out = ndimage.convolve1d(img, k0, axis=0, mode='reflect')
+        out = ndimage.convolve1d(out, k1, axis=1, mode='reflect')
+        return out
+
+    return {
+        'raw': img,
+        'haar_ll': sep(low, low),
+        'haar_lh': np.abs(sep(low, high)), # the abs gets rid of the directionality and moreso makes an energy map
+        'haar_hl': np.abs(sep(high, low)),
+        'haar_hh': np.abs(sep(high, high)),
+    }
+
+
+# ---------- dense map engine ----------
+
+def _feature_dict_for_patch(
+    patch: np.ndarray,
+    patch_q: np.ndarray,
+    families: tuple[str, ...],
+    levels: int,
+    glcm_params: GLCMParams | None = None,
+) -> dict[str, float]:
+    out = {}
+    if 'firstorder' in families:
+        out.update(_nanmean_std_percentiles(patch, bins=levels))
+    if 'heterogeneity' in families:
+        out.update(heterogeneity_features_patch(patch, levels=levels))
+    if 'band_energy' in families:
+        out.update(band_energy_features_patch(patch))
+    if 'glcm' in families:
+        out.update(glcm_features_patch(patch_q, levels=levels, glcm_params=glcm_params))
+    if 'glrlm' in families:
+        out.update(glrlm_features_patch(patch_q, levels=levels))
+    if 'glszm' in families:
+        out.update(glszm_features_patch(patch_q, levels=levels))
+    if 'gldm' in families:
+        out.update(gldm_features_patch(patch_q, levels=levels))
+    if 'ngtdm' in families:
+        out.update(ngtdm_features_patch(patch_q, levels=levels))
+    if 'lbp' in families:
+        out.update(lbp_features_patch(patch, levels=levels))
+    if 'gradient' in families:
+        out.update(gradient_orientation_features_patch(patch))
+    return out
+
+def _row_worker(
+    r: int,
+    cols: np.ndarray,
+    images: dict[str, np.ndarray],
+    quantized: dict[str, np.ndarray],
+    window: int,
+    mask: np.ndarray | None,
+    min_valid_frac: float,
+    families: tuple[str, ...],
+    levels: int,
+    glcm_params: GLCMParams | None = None,
+) -> list[tuple[int, dict[str, float]]]:
+    rad = window // 2
+    row_results = []
+    for c in cols:
+        r0, r1 = r - rad, r + rad + 1
+        c0, c1 = c - rad, c + rad + 1
+        patch_mask = None if mask is None else mask[r0:r1, c0:c1]
+
+        if patch_mask is not None and patch_mask.mean() < min_valid_frac:
+            row_results.append((c, {}))
+            continue
+
+        feats = {}
+        for band_name, image in images.items():
+            patch = image[r0:r1, c0:c1]
+            patch_q = quantized[band_name][r0:r1, c0:c1]
+            patch_feats = _feature_dict_for_patch(
+                patch,
+                patch_q,
+                families=families,
+                levels=levels,
+                glcm_params=glcm_params,
+            )
+            for k, v in patch_feats.items():
+                feats[f'{band_name}__{k}'] = v
+
+        row_results.append((c, feats))
+    return row_results
+
+
+def compute_dense_texture_maps(
+    image: np.ndarray,
+    window: int = 31,
+    step: int = 2,
+    mask: np.ndarray | None = None,
+    families: tuple[str, ...] = (
+        'firstorder', 'heterogeneity', 'band_energy',
+        'glcm', 'glrlm', 'glszm', 'gldm', 'ngtdm', 'lbp', 'gradient'
+    ),
+    include_wavelet: bool = True,
+    levels: int = 16,
+    min_valid_frac: float = 0.5,
+    n_jobs: int = 1,
+    band_clip_values: dict[str, tuple[float, float]] | None = None,
+    glcm_params: GLCMParams | None = None,
+) -> tuple[dict[str, np.ndarray], DenseMapMeta]:
+    """
+    Generic dense texture engine.
+
+    Output maps live on the sampled grid. Use step=1 or 2 for dense maps, larger
+    step for fast previews.
+    """
+    if glcm_params is None:
+        glcm_params = GLCMParams()
+
+    img = image.astype(np.float32)
+    if img.ndim != 2:
+        raise ValueError('compute_dense_texture_maps expects one 2D image')
+    if window % 2 == 0:
+        raise ValueError('window must be odd')
+
+    bands = haar_like_bands(img) if include_wavelet else {'raw': img}
+    quantized = {
+        name: robust_rescale_uint(
+            arr,
+            levels=levels,
+            clip_values=None if band_clip_values is None else band_clip_values.get(name),
+        )
+        for name, arr in bands.items()
+    }
+
+    rad = window // 2
+    rows = np.arange(rad, img.shape[0] - rad, step)
+    cols = np.arange(rad, img.shape[1] - rad, step)
+    if len(rows) == 0 or len(cols) == 0:
+        raise ValueError('window too large for image')
+
+    worker = delayed(_row_worker)
+    results = Parallel(n_jobs=n_jobs, prefer='processes')(
+        worker(
+            r,
+            cols,
+            bands,
+            quantized,
+            window,
+            mask,
+            min_valid_frac,
+            families,
+            levels,
+            glcm_params,
+        )
+        for r in rows
+    )
+
+    feature_names = set()
+    for row in results:
+        for _, feats in row:
+            feature_names.update(feats)
+
+    maps = {
+        name: np.full((len(rows), len(cols)), np.nan, dtype=np.float32)
+        for name in sorted(feature_names)
+    }
+
+    for i, row in enumerate(results):
+        for j, (_, feats) in enumerate(row):
+            for name, value in feats.items():
+                maps[name][i, j] = value
+
+    meta = DenseMapMeta(
+        row_centers=rows,
+        col_centers=cols,
+        window=window,
+        step=step,
+        image_shape=img.shape,
+    )
+    return maps, meta
+
+def resample_map_to_image(feature_map: np.ndarray, meta: DenseMapMeta, order: int = 1) -> np.ndarray:
+    """Resize a sampled-grid map back to image size for quick visualization."""
+    return resize(feature_map, meta.image_shape, order=order, preserve_range=True, anti_aliasing=False).astype(np.float32)
+
+
+_COMPACT_TEXTURE_META_KEY = "__manifest_json__"
+
+def _open_compact_texture_zarr_group(
+    out_zarr_path: str | Path,
+    z_len: int,
+    rc_shape: tuple[int, int],
+    feature_names: list[str],
+    chunks: tuple[int, int, int] | None = None,
+    overwrite: bool = True,
+):
+    """
+    Compact sampled-grid storage:
+        one dataset per feature, shaped (Z_selected, R, C)
+    """
+    out_zarr_path = Path(out_zarr_path)
+    compressor = numcodecs.Blosc(
+        cname='lz4',
+        clevel=3,
+        shuffle=numcodecs.Blosc.BITSHUFFLE,
+    )
+
+    if chunks is None:
+        rdim, cdim = rc_shape
+        chunks = (1, min(256, rdim), min(256, cdim))
+
+    try:
+        root = zarr.open_group(
+            str(out_zarr_path),
+            mode='w' if overwrite else 'a',
+            zarr_format=2,
+        )
+    except TypeError:
+        root = zarr.open_group(
+            str(out_zarr_path),
+            mode='w' if overwrite else 'a',
+        )
+
+    datasets = {}
+    shape = (int(z_len), int(rc_shape[0]), int(rc_shape[1]))
+    for name in feature_names:
+        if hasattr(root, "create_array"):
+            datasets[name] = root.create_array(
+                name=name,
+                shape=shape,
+                chunks=chunks,
+                dtype=np.float32,
+                compressor=compressor,
+                overwrite=overwrite,
+                fill_value=np.nan,
+            )
+        else:
+            datasets[name] = root.create_dataset(
+                name=name,
+                shape=shape,
+                chunks=chunks,
+                dtype=np.float32,
+                compressor=compressor,
+                overwrite=overwrite,
+                fill_value=np.nan,
+            )
+    root.attrs['compact_shape'] = shape
+    root.attrs['chunks'] = tuple(int(v) for v in chunks)
+    return root, datasets
+
+
+def _compact_zarr_feature_names(root) -> list[str]:
+    return sorted(root.array_keys())
+
+
+def load_compact_texture_zarr(zarr_path: str | Path):
+    root = zarr.open_group(str(zarr_path), mode='r')
+    manifest_json = root.attrs.get('manifest_json', None)
+    if manifest_json is None:
+        raise ValueError(f'No manifest_json found in compact texture zarr: {zarr_path}')
+    manifest = json.loads(manifest_json)
+    return root, manifest
+
+
+def _submit_one_compact_bscan_future(
+    ex,
+    vol,
+    out_i: int,
+    z: int,
+    y_min: int,
+    y_max: int,
+    step: int,
+    families: tuple[str, ...],
+    include_wavelet: bool,
+    texture_params: TextureSweepParams,
+    features_to_keep: tuple[str, ...] | None,
+    single_bscan_n_jobs: int,
+    band_clip_values: dict[str, tuple[float, float]] | None = None,
+    glcm_params: GLCMParams | None = None,
+):
+    return ex.submit(
+        _compute_one_bscan_texture_compact,
+        z=int(z),
+        bscan=np.asarray(vol[z], dtype=np.float32),
+        y_min=y_min,
+        y_max=y_max,
+        step=step,
+        families=families,
+        include_wavelet=include_wavelet,
+        texture_params=texture_params,
+        features_to_keep=features_to_keep,
+        n_jobs=single_bscan_n_jobs,
+        band_clip_values=band_clip_values,
+        glcm_params=glcm_params,
+    ), out_i
+
+
+def compute_bscan_texture_volumes_to_compact_zarr(
+    volume,
+    upper_bound: np.ndarray,
+    lower_bound: np.ndarray,
+    out_zarr_path: str | Path,
+    z_step: int = 1,
+    step: int = 4,
+    pad: int = 10,
+    families: tuple[str, ...] = (
+        'firstorder', 'heterogeneity', 'band_energy',
+        'glcm', 'glrlm', 'glszm', 'gldm', 'ngtdm', 'lbp', 'gradient'
+    ),
+    include_wavelet: bool = False,
+    features_to_keep: tuple[str, ...] | None = None,
+    n_jobs: int = 1,
+    single_bscan_n_jobs: int = 1,
+    texture_params: TextureSweepParams | None = None,
+    glcm_params: GLCMParams | None = None,
+    overwrite: bool = True,
+    chunks: tuple[int, int, int] | None = None,
+) -> Path:    
+    """
+    Memory-safe compact dense texture artifact.
+
+    Writes one compact zarr group per volume with:
+      - one dataset per feature: (Z_selected, R, C)
+      - manifest in root attrs
+    """
+    texture_params = texture_params.concrete()
+    if glcm_params is None:
+        glcm_params = GLCMParams()
+
+    vol = volume
+    if getattr(vol, 'ndim', None) != 3:
+        raise ValueError('volume must be (Z, Y, X)')
+    if upper_bound.shape != (vol.shape[0], vol.shape[2]):
+        raise ValueError('upper_bound must have shape (Z, X)')
+    if lower_bound.shape != (vol.shape[0], vol.shape[2]):
+        raise ValueError('lower_bound must have shape (Z, X)')
+
+    z_idx = np.arange(0, int(vol.shape[0]), z_step, dtype=int)
+    if len(z_idx) == 0:
+        raise ValueError('No z indices selected')
+
+    y_min, y_max = _compute_global_texture_crop_bounds(
+        upper_bound=upper_bound,
+        lower_bound=lower_bound,
+        full_y=int(vol.shape[1]),
+        pad=pad,
+        window=int(texture_params.window),
+    )
+
+    t1 = time.time()
+    print(f"computing global intensity info for glcm binning")
+    band_clip_values = compute_volume_level_band_clip_values(
+        volume=vol,
+        y_min=y_min,
+        y_max=y_max,
+        texture_params=texture_params,
+        include_wavelet=include_wavelet,
+        clip_percentiles=(1, 99),
+    )
+    t2 = time.time()
+    print(f"done in {t2-t1} seconds")
+
+    z0 = int(z_idx[0])
+
+    _, first_maps, first_meta = _compute_one_bscan_texture_compact(
+        z=z0,
+        bscan=np.asarray(vol[z0], dtype=np.float32),
+        y_min=y_min,
+        y_max=y_max,
+        step=step,
+        families=families,
+        include_wavelet=include_wavelet,
+        texture_params=texture_params,
+        features_to_keep=features_to_keep,
+        n_jobs=single_bscan_n_jobs,
+        band_clip_values=band_clip_values,
+        glcm_params=glcm_params,
+    )
+
+
+    feature_names = sorted(first_maps)
+    if not feature_names:
+        raise ValueError('No feature maps were produced')
+
+    rc_shape = first_maps[feature_names[0]].shape
+
+    root, zarr_datasets = _open_compact_texture_zarr_group(
+        out_zarr_path=out_zarr_path,
+        z_len=len(z_idx),
+        rc_shape=rc_shape,
+        feature_names=feature_names,
+        chunks=chunks,
+        overwrite=overwrite,
+    )
+
+    manifest = dict(
+        format='compact_texture_zarr_v1',
+        volume_shape=[int(v) for v in vol.shape],
+        crop_y_bounds=[int(y_min), int(y_max)],
+        crop_shape=[int(y_max - y_min), int(vol.shape[2])],
+        row_centers_full=(first_meta.row_centers + y_min).astype(int).tolist(),
+        col_centers=first_meta.col_centers.astype(int).tolist(),
+        z_indices=z_idx.astype(int).tolist(),
+        step=int(step),
+        pad=int(pad),
+        include_wavelet=bool(include_wavelet),
+        families=list(families),
+        features=feature_names,
+        texture_params=texture_params.as_attrs(),
+        window=int(texture_params.window),
+        levels=int(texture_params.levels),
+        gaussian_sigma=float(texture_params.gaussian_sigma),
+        downsample_factor=int(texture_params.downsample_factor),
+        band_clip_values={
+                k: [float(v[0]), float(v[1])]
+                for k, v in band_clip_values.items()
+        },
+        glcm_params=dict(
+                distances=[int(x) for x in glcm_params.distances],
+                angles_deg=[float(x) for x in glcm_params.angles_deg],
+                aggregate_distances=bool(glcm_params.aggregate_distances),
+                aggregate_angles=bool(glcm_params.aggregate_angles),
+            ),
+
+
+
+    )
+
+    root.attrs['manifest_json'] = json.dumps(manifest)
+    root.attrs['texture_params'] = texture_params.as_attrs()
+    root.attrs['z_step'] = int(z_step)
+    root.attrs['step'] = int(step)
+    root.attrs['pad'] = int(pad)
+    root.attrs['include_wavelet'] = bool(include_wavelet)
+    root.attrs['families'] = list(families)
+    root.attrs['features_to_keep'] = None if features_to_keep is None else list(features_to_keep)
+    root.attrs['band_clip_values_json'] = json.dumps(
+        {k: [float(v[0]), float(v[1])] for k, v in band_clip_values.items()}
+    )
+    root.attrs['glcm_params_json'] = json.dumps({
+            'distances': [int(x) for x in glcm_params.distances],
+            'angles_deg': [float(x) for x in glcm_params.angles_deg],
+            'aggregate_distances': bool(glcm_params.aggregate_distances),
+            'aggregate_angles': bool(glcm_params.aggregate_angles),
+        })
+
+    for name, arr in first_maps.items():
+        zarr_datasets[name][0, :, :] = arr.astype(np.float32, copy=False)
+
+    remaining = [(out_i, int(z)) for out_i, z in enumerate(z_idx[1:], start=1)]
+
+    if n_jobs == 1:
+        for out_i, z in remaining:
+            _, maps, _ = _compute_one_bscan_texture_compact(
+                z=z,
+                bscan=np.asarray(vol[z], dtype=np.float32),
+                y_min=y_min,
+                y_max=y_max,
+                step=step,
+                families=families,
+                include_wavelet=include_wavelet,
+                texture_params=texture_params,
+                features_to_keep=features_to_keep,
+                n_jobs=single_bscan_n_jobs,
+                band_clip_values=band_clip_values,
+                glcm_params=glcm_params,
+            )
+
+
+            for name, arr in maps.items():
+                zarr_datasets[name][out_i, :, :] = arr.astype(np.float32, copy=False)
+    else:
+        with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+            pending = {}
+
+            remaining_iter = iter(remaining)
+            for _ in range(n_jobs):
+                try:
+                    out_i, z = next(remaining_iter)
+                except StopIteration:
+                    break
+                fut, out_i = _submit_one_compact_bscan_future(
+                    ex=ex,
+                    vol=vol,
+                    out_i=out_i,
+                    z=z,
+                    y_min=y_min,
+                    y_max=y_max,
+                    step=step,
+                    families=families,
+                    include_wavelet=include_wavelet,
+                    texture_params=texture_params,
+                    features_to_keep=features_to_keep,
+                    single_bscan_n_jobs=single_bscan_n_jobs,
+                    band_clip_values=band_clip_values,
+                    glcm_params=glcm_params,
+                )
+                pending[fut] = out_i
+
+            while pending:
+                done, _ = wait(set(pending.keys()), return_when=FIRST_COMPLETED)
+
+                for fut in done:
+                    out_i = pending.pop(fut)
+                    _, maps, _ = fut.result()
+                    for name, arr in maps.items():
+                        zarr_datasets[name][out_i, :, :] = arr.astype(np.float32, copy=False)
+
+                    try:
+                        next_out_i, next_z = next(remaining_iter)
+                    except StopIteration:
+                        continue
+
+                    next_fut, next_out_i = _submit_one_compact_bscan_future(
+                        ex=ex,
+                        vol=vol,
+                        out_i=next_out_i,
+                        z=next_z,
+                        y_min=y_min,
+                        y_max=y_max,
+                        step=step,
+                        families=families,
+                        include_wavelet=include_wavelet,
+                        texture_params=texture_params,
+                        features_to_keep=features_to_keep,
+                        single_bscan_n_jobs=single_bscan_n_jobs,
+                        band_clip_values=band_clip_values,
+                        glcm_params=glcm_params,
+                    )
+                    pending[next_fut] = next_out_i
+
+    zarr.consolidate_metadata(str(out_zarr_path))
+    return Path(out_zarr_path)
+
+
+def instantiate_fullsize_texture_volumes_from_compact_zarr(
+    compact_zarr_path: str | Path,
+    out_zarr_path: str | Path,
+    features_to_keep: tuple[str, ...] | None = None,
+    fill_value: float = np.nan,
+    overwrite: bool = True,
+    chunks: tuple[int, int, int] | None = None,
+) -> Path:
+    """
+    Materialize compact sampled-band texture maps back into full-size (Z, Y, X)
+    feature volumes as a zarr group.
+    """
+    root, manifest = load_compact_texture_zarr(compact_zarr_path)
+
+    volume_shape = tuple(int(v) for v in manifest['volume_shape'])
+    y_min, y_max = [int(v) for v in manifest['crop_y_bounds']]
+    crop_shape = tuple(int(v) for v in manifest['crop_shape'])
+    z_indices = np.asarray(manifest['z_indices'], dtype=int)
+
+    all_features = _compact_zarr_feature_names(root)
+    if features_to_keep is None:
+        features = all_features
+    else:
+        keep = set(features_to_keep)
+        features = [f for f in all_features if f in keep]
+
+    if not features:
+
+        print(f'All features are :{all_features}')
+        raise ValueError('No features selected for instantiation.\n\n')
+
+    sample_meta = DenseMapMeta(
+        row_centers=np.asarray(manifest['row_centers_full'], dtype=int) - y_min,
+        col_centers=np.asarray(manifest['col_centers'], dtype=int),
+        window=int(manifest['window']),
+        step=int(manifest['step']),
+        image_shape=crop_shape,
+    )
+
+    out_root, zarr_datasets = _open_texture_zarr_group(
+        out_zarr_path=out_zarr_path,
+        volume_shape=volume_shape,
+        feature_names=features,
+        chunks=chunks,
+        overwrite=overwrite,
+    )
+    out_root.attrs['source_compact_zarr'] = str(compact_zarr_path)
+
+    for feat in features:
+        ds = root[feat]
+        for local_i, z in enumerate(z_indices):
+            full_slice = np.full(volume_shape[1:], fill_value, dtype=np.float32)
+            full_slice[y_min:y_max, :] = resample_map_to_image(
+                np.asarray(ds[local_i], dtype=np.float32),
+                sample_meta,
+            )
+            zarr_datasets[feat][int(z), :, :] = full_slice
+
+    zarr.consolidate_metadata(str(out_zarr_path))
+    return Path(out_zarr_path)
+
+
+def project_texture_compact_zarr_to_enface_for_volume(
+    vol_path,
+    compact_zarr_path,
+    flat_layers_npz,
+    line_key=None,
+    candidate_slabs=[[5, 15]],
+    features=None,
+    interp_x=True,
+):
+    """
+    Compact-Zarr equivalent of project_texture_compact_npz_to_enface_for_volume(...).
+    """
+    from pathlib import Path
+    import numpy as np
+    from code_files import file_utils
+
+    vol_path = Path(vol_path)
+    root, manifest = load_compact_texture_zarr(compact_zarr_path)
+    flat_layers = np.load(flat_layers_npz)
+
+    if line_key is None:
+        line_key = file_utils.get_algorithm_key_from_filepath(vol_path)
+
+    center = flat_layers[line_key]
+    row_centers_full = np.asarray(manifest['row_centers_full'], dtype=np.int32)
+    col_centers = np.asarray(manifest['col_centers'], dtype=np.int32)
+
+    if features is None:
+        features = _compact_zarr_feature_names(root)
+
+    out = {}
+    for feat in features:
+        proj = CompactTextureSlabProjector(
+            texture_vol=root[feat],
+            row_centers_full=row_centers_full,
+            col_centers=col_centers,
+        )
+        for bottom_offset, top_offset in candidate_slabs:
+            enface = proj.project_between(
+                center - top_offset,
+                center - bottom_offset,
+                interp_x=interp_x,
+                full_x=center.shape[1],
+            )
+            out[f"{feat}|{bottom_offset}->{top_offset}"] = enface
+
+    return out
+
+
+# THE OLD COMPACT STUFF TO DELETE<<
+
+
+
+def _compact_feature_names(npz_obj) -> list[str]:
+    return sorted(k for k in npz_obj.files if k != _COMPACT_TEXTURE_META_KEY)
+
+
+def load_compact_texture_npz(npz_path: str | Path):
+    """
+    Returns:
+        obj: np.load(...) handle
+        manifest: parsed json dict
+    """
+    obj = np.load(npz_path, allow_pickle=False)
+    manifest = json.loads(str(obj[_COMPACT_TEXTURE_META_KEY].item()))
+    return obj, manifest
+
+
+def _compute_global_texture_crop_bounds(
+    upper_bound: np.ndarray,
+    lower_bound: np.ndarray,
+    full_y: int,
+    pad: int,
+    window: int,
+) -> tuple[int, int]:
+    """
+    One global Y crop for the whole volume.
+    This is much cleaner for compact storage than per-B-scan variable-height crops.
+    """
+    y_min = int(np.floor(np.minimum(upper_bound, lower_bound).min() - pad - window))
+    y_max = int(np.ceil(np.maximum(upper_bound, lower_bound).max() + pad + window))
+
+    y_min = max(0, y_min)
+    y_max = min(int(full_y), y_max)
+
+    if y_max <= y_min:
+        raise ValueError(f"Invalid crop bounds: y_min={y_min}, y_max={y_max}")
+
+    return y_min, y_max
+
+def _compute_one_bscan_texture_compact(
+    z: int,
+    bscan: np.ndarray,
+    y_min: int,
+    y_max: int,
+    step: int,
+    families: tuple[str, ...],
+    include_wavelet: bool,
+    texture_params: TextureSweepParams,
+    features_to_keep: tuple[str, ...] | None = None,
+    n_jobs: int = 1,
+    band_clip_values: dict[str, tuple[float, float]] | None = None,
+    glcm_params: GLCMParams | None = None,
+) -> tuple[int, dict[str, np.ndarray], DenseMapMeta]:
+    """
+    Compute sampled-grid feature maps on one fixed crop band.
+    No upsampling. No full-size padding.
+    """
+    crop = bscan[y_min:y_max]
+    texture_params = texture_params.concrete()
+
+    if glcm_params is None:
+        glcm_params = GLCMParams()
+
+    crop = preprocess_texture_image(crop, texture_params)
+
+    maps, meta = compute_dense_texture_maps(
+        crop,
+        window=int(texture_params.window),
+        step=step,
+        mask=None,
+        families=families,
+        include_wavelet=include_wavelet,
+        levels=int(texture_params.levels),
+        n_jobs=n_jobs,
+        band_clip_values=band_clip_values,
+        glcm_params=glcm_params,
+    )
+
+    if features_to_keep is not None:
+        keep = set(features_to_keep)
+        maps = {k: v for k, v in maps.items() if k in keep}
+
+    return z, maps, meta
+
+def compute_bscan_texture_volumes_to_compact_npz(
+    volume: np.ndarray,
+    upper_bound: np.ndarray,
+    lower_bound: np.ndarray,
+    out_npz_path: str | Path,
+    z_step: int = 1,
+    window: int = 31,
+    step: int = 4,
+    pad: int = 10,
+    families: tuple[str, ...] = ('firstorder', 'glcm', 'glrlm', 'glszm', 'gldm', 'ngtdm', 'lbp', 'gradient'),
+    include_wavelet: bool = False,
+    levels: int = 32,
+    features_to_keep: tuple[str, ...] | None = None,
+    n_jobs: int = 1,
+    single_bscan_n_jobs: int = 1,
+    texture_params: TextureSweepParams | None = None,
+) -> Path:
+    """
+    Compact dense texture artifact.
+
+    Saves one NPZ per volume with:
+      - one array per feature: (Z_selected, R, C)
+      - one manifest json string with all metadata needed to:
+            1) project en-face directly
+            2) materialize later to full-size npz or zarr
+    """
+    vol = np.asarray(volume)
+    if vol.ndim != 3:
+        raise ValueError('volume must be (Z, Y, X)')
+    if upper_bound.shape != (vol.shape[0], vol.shape[2]):
+        raise ValueError('upper_bound must have shape (Z, X)')
+    if lower_bound.shape != (vol.shape[0], vol.shape[2]):
+        raise ValueError('lower_bound must have shape (Z, X)')
+
+    texture_params = texture_params.concrete()
+
+    z_idx = np.arange(0, vol.shape[0], z_step, dtype=int)
+    if len(z_idx) == 0:
+        raise ValueError('No z indices selected')
+
+    y_min, y_max = _compute_global_texture_crop_bounds(
+        upper_bound=upper_bound,
+        lower_bound=lower_bound,
+        full_y=vol.shape[1],
+        pad=pad,
+        window=texture_params.window,
+    )
+
+    # Probe first slice to discover feature names and sampled grid size.
+    z0 = int(z_idx[0])
+    _, first_maps, first_meta = _compute_one_bscan_texture_compact(
+        z=z0,
+        bscan=vol[z0].astype(np.float32),
+        y_min=y_min,
+        y_max=y_max,
+        # window=window,
+        step=step,
+        families=families,
+        include_wavelet=include_wavelet,
+        texture_params=texture_params,
+        # levels=levels,
+        features_to_keep=features_to_keep,
+        n_jobs=single_bscan_n_jobs,
+    )
+
+    feature_names = sorted(first_maps)
+    if not feature_names:
+        raise ValueError('No feature maps were produced')
+
+    compact_maps = {
+        name: np.full((len(z_idx),) + first_maps[name].shape, np.nan, dtype=np.float32)
+        for name in feature_names
+    }
+
+    for name, arr in first_maps.items():
+        compact_maps[name][0] = arr.astype(np.float32, copy=False)
+
+    if n_jobs == 1:
+        for out_i, z in enumerate(z_idx[1:], start=1):
+            _, maps, _ = _compute_one_bscan_texture_compact(
+                z=int(z),
+                bscan=vol[z].astype(np.float32),
+                y_min=y_min,
+                y_max=y_max,
+                # window=window,
+                step=step,
+                families=families,
+                texture_params=texture_params,
+                include_wavelet=include_wavelet,
+                # levels=levels,
+                features_to_keep=features_to_keep,
+                n_jobs=single_bscan_n_jobs,
+            )
+            for name, arr in maps.items():
+                compact_maps[name][out_i] = arr.astype(np.float32, copy=False)
+    else:
+        with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+            futures = [
+                    ex.submit(
+                    _compute_one_bscan_texture_compact,
+                    z=int(z),
+                    bscan=vol[z].astype(np.float32),
+                    y_min=y_min,
+                    y_max=y_max,
+                    step=step,
+                    families=families,
+                    include_wavelet=include_wavelet,
+                    texture_params=texture_params,
+                    features_to_keep=features_to_keep,
+                    n_jobs=single_bscan_n_jobs,
+                )
+                for z in z_idx[1:]
+            ]
+
+            by_z = {}
+            for fut in as_completed(futures):
+                z, maps, _ = fut.result()
+                by_z[int(z)] = maps
+
+        for out_i, z in enumerate(z_idx[1:], start=1):
+            maps = by_z[int(z)]
+            for name, arr in maps.items():
+                compact_maps[name][out_i] = arr.astype(np.float32, copy=False)
+
+    manifest = dict(
+        format='compact_texture_npz_v1',
+        volume_shape=[int(v) for v in vol.shape],          # shape of the flattened volume passed in
+        crop_y_bounds=[int(y_min), int(y_max)],           # full-image Y coords
+        crop_shape=[int(y_max - y_min), int(vol.shape[2])],
+        row_centers_full=(first_meta.row_centers + y_min).astype(int).tolist(),
+        col_centers=first_meta.col_centers.astype(int).tolist(),
+        z_indices=z_idx.astype(int).tolist(),
+        # window=int(window),
+        step=int(step),
+        pad=int(pad),
+        # levels=int(levels),
+        include_wavelet=bool(include_wavelet),
+        families=list(families),
+        features=feature_names,
+
+        texture_params= texture_params.as_attrs(),
+        window= int(texture_params.window),
+        levels= int(texture_params.levels),
+        gaussian_sigma= float(texture_params.gaussian_sigma),
+        downsample_factor= int(texture_params.downsample_factor),
+    )
+
+    payload = {
+        _COMPACT_TEXTURE_META_KEY: np.array(json.dumps(manifest)),
+        **compact_maps,
+    }
+
+    out_npz_path = Path(out_npz_path)
+    out_npz_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out_npz_path, **payload)
+    return out_npz_path
+
+
+def instantiate_fullsize_texture_volumes_from_compact(
+    compact_npz_path: str | Path,
+    out_path: str | Path | None = None,
+    output_format: str = 'zarr',   # 'zarr' or 'npz'
+    features_to_keep: tuple[str, ...] | None = None,
+    fill_value: float = np.nan,
+    overwrite: bool = True,
+    chunks: tuple[int, int, int] | None = None,
+):
+    """
+    Materialize compact sampled-band texture maps back into full-size (Z, Y, X)
+    feature volumes. Useful for review/debugging only.
+
+    output_format:
+        'zarr' -> writes one dataset per feature shaped (Z, Y, X)
+        'npz'  -> writes one full array per feature inside one NPZ
+    """
+    obj, manifest = load_compact_texture_npz(compact_npz_path)
+
+    volume_shape = tuple(int(v) for v in manifest['volume_shape'])
+    y_min, y_max = [int(v) for v in manifest['crop_y_bounds']]
+    crop_shape = tuple(int(v) for v in manifest['crop_shape'])
+    z_indices = np.asarray(manifest['z_indices'], dtype=int)
+
+    all_features = _compact_feature_names(obj)
+    if features_to_keep is None:
+        features = all_features
+    else:
+        keep = set(features_to_keep)
+        features = [f for f in all_features if f in keep]
+
+    if not features:
+        raise ValueError('No features selected for instantiation')
+
+    sample_meta = DenseMapMeta(
+        row_centers=np.asarray(manifest['row_centers_full'], dtype=int) - y_min,
+        col_centers=np.asarray(manifest['col_centers'], dtype=int),
+        window=int(manifest['window']),
+        step=int(manifest['step']),
+        image_shape=crop_shape,
+    )
+
+    if output_format == 'npz':
+        full_maps = {}
+        for feat in features:
+            small = obj[feat]  # (Z_selected, R, C)
+            full = np.full(volume_shape, fill_value, dtype=np.float32)
+
+            for local_i, z in enumerate(z_indices):
+                full[z, y_min:y_max, :] = resample_map_to_image(small[local_i], sample_meta)
+
+            full_maps[feat] = full
+
+        if out_path is not None:
+            out_path = Path(out_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(out_path, **full_maps)
+            return out_path
+
+        return full_maps
+
+    if output_format != 'zarr':
+        raise ValueError("output_format must be 'zarr' or 'npz'")
+
+    if out_path is None:
+        raise ValueError("out_path is required when output_format='zarr'")
+
+    root, zarr_datasets = _open_texture_zarr_group(
+        out_zarr_path=out_path,
+        volume_shape=volume_shape,
+        feature_names=features,
+        chunks=chunks,
+        overwrite=overwrite,
+    )
+    root.attrs['source_compact_npz'] = str(compact_npz_path)
+
+    for feat in features:
+        small = obj[feat]
+        for local_i, z in enumerate(z_indices):
+            full_slice = np.full(volume_shape[1:], fill_value, dtype=np.float32)
+            full_slice[y_min:y_max, :] = resample_map_to_image(small[local_i], sample_meta)
+            zarr_datasets[feat][int(z), :, :] = full_slice
+
+    zarr.consolidate_metadata(str(out_path))
+    return Path(out_path)
+
+
+
+
+def _open_texture_zarr_group(
+    out_zarr_path: str | Path,
+    volume_shape: tuple[int, int, int],
+    feature_names: list[str],
+    chunks: tuple[int, int, int] | None = None,
+    overwrite: bool = True,
+):
+    """
+    Create one zarr group with one dataset per feature, each shaped (Z, Y, X).
+    """
+    out_zarr_path = Path(out_zarr_path)
+    compressor = numcodecs.Blosc(
+        cname='lz4',
+        clevel=3,
+        shuffle=numcodecs.Blosc.BITSHUFFLE,
+    )
+
+    if chunks is None:
+        zdim, ydim, xdim = volume_shape
+        chunks = (1, min(256, ydim), min(256, xdim))
+
+    try:
+        root = zarr.open_group(
+            str(out_zarr_path),
+            mode='w' if overwrite else 'a',
+            zarr_format=2,
+        )
+    except TypeError:
+        root = zarr.open_group(
+            str(out_zarr_path),
+            mode='w' if overwrite else 'a',
+        )
+
+    datasets = {}
+    for name in feature_names:
+
+        if hasattr(root, "create_array"):
+            datasets[name] = root.create_array(
+                name=name,
+                shape=volume_shape, # This might cause fail
+                chunks=chunks,
+                dtype=np.float32,
+                compressor=compressor,
+                overwrite=overwrite,
+                fill_value=np.nan,
+            )
+        else:
+            datasets[name] = root.create_dataset(
+                name=name,
+                # shape=shape,
+                shape=volume_shape, # This might cause fail
+                chunks=chunks,
+                dtype=np.float32,
+                compressor=compressor,
+                overwrite=overwrite,
+                fill_value=np.nan,
+            )
+    root.attrs['volume_shape'] = tuple(int(v) for v in volume_shape)
+    root.attrs['chunks'] = tuple(int(v) for v in chunks)
+    return root, datasets
+
+
+
+# ---------- B-scan -> en-face ----------
+
+
+
+
+def project_texture_zarr_to_enface_for_volume(
+    vol_path,
+    texture_zarr_path,
+    flat_layers_npz,
+    line_key=None,
+    candidate_slabs = [[5,15]],
+    features=None,
+    interp_x=True,
+):
+    """
+    Load a thick texture zarr and re-project a thinner slab to en-face.
+
+    candidate_slabs are [bottom_idx offset from RPE line, top index offset from RPE line (lower y value)]
+    line_key:
+      None -> use file_utils.get_algorithm_key_from_filepath(vol_path)
+      str  -> use that flattened layer key directly
+    """
+    from pathlib import Path
+    import numpy as np
+    import zarr
+    from code_files import file_utils
+
+    vol_path = Path(vol_path)
+    flat_layers = np.load(flat_layers_npz)
+
+    if line_key is None:
+        line_key = file_utils.get_algorithm_key_from_filepath(vol_path)
+
+    root = zarr.open_group(str(texture_zarr_path), mode='r')
+    center = flat_layers[line_key]
+
+    if features is None:
+        features = list(root.array_keys())
+
+    out = {}
+    for feat in features:
+        proj = TextureSlabProjector(
+                    texture_vol=root[feat],   # pass zarr-backed array, not full np.asarray
+                    reference_line=center,
+                    max_top_offset=min(t for b, t in candidate_slabs),
+                    max_bottom_offset=max(b for b, t in candidate_slabs),
+                    extra_pad=2,
+                )
+        for bottom_offset, top_offset in candidate_slabs:
+            enface = proj.project_between(center - top_offset, center - bottom_offset,interp_x=interp_x)
+            out[f"{feat}|{bottom_offset}->{top_offset}"] = enface
+    return out
+
+
+def slab_average_to_enface(
+    volume: np.ndarray,
+    upper_bound: np.ndarray,
+    lower_bound: np.ndarray,
+    pad: int = 5,
+    statistic: str = 'mean',
+) -> np.ndarray:
+    """Collapse each B-scan slab directly into an en-face image before any texture computation."""
+    stat_fn = np.nanmean if statistic == 'mean' else np.nanmedian
+    vol = np.asarray(volume)
+    out = np.full((vol.shape[0], vol.shape[2]), np.nan, dtype=np.float32)
+    for z in range(vol.shape[0]):
+        for x in range(vol.shape[2]):
+            lo = max(0, int(np.floor(min(upper_bound[z, x], lower_bound[z, x]) - pad)))
+            hi = min(vol.shape[1], int(np.ceil(max(upper_bound[z, x], lower_bound[z, x]) + pad)) + 1)
+            if hi > lo:
+                out[z, x] = float(stat_fn(vol[z, lo:hi, x]))
+    return out
+
+def save_enface_feature_maps_npz(
+    feature_maps: dict[str, np.ndarray],
+    out_npz_path: str | Path,
+) -> Path:
+    """
+    Save small en-face feature maps, shape (Z, X), into one NPZ.
+    """
+    out_npz_path = Path(out_npz_path)
+    out_npz_path.parent.mkdir(parents=True, exist_ok=True)
+
+    arrays = {
+        name: np.asarray(arr, dtype=np.float32)
+        for name, arr in feature_maps.items()
+    }
+    np.savez_compressed(out_npz_path, **arrays)
+    return out_npz_path
+
